@@ -1,2 +1,2 @@
 # B-SIde
-B-SIde is a toolbox for system identification from a Bayesian perspective.
+B-SIde is a toolbox for system identification from a Bayesian perspective. The name is an abbreviated form of Bayesian System Identification and alludes to the fact that the current prevailing methods for system identification are derived from the classical, rather than Bayesian, statistical perspective. Therefore, the Bayesian approach can be viewed, to a certain extent, as an alternative (or B-side) to these algorithms.
