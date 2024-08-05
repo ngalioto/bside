@@ -294,8 +294,7 @@ class DataTrajectories:
         self.start_indices = torch.where(frame_numbers == 0)[0]
         self.end_indices = torch.cat((self.start_indices[1:], torch.tensor([self.y.shape[0]])))
 
-        self.num_traj = len(self.start_indices)
-        self.traj_lengths = self.end_indices - self.start_indices
+        self._set_traj_from_indices()
 
     def _init_from_batch(
         self,
@@ -320,8 +319,29 @@ class DataTrajectories:
         self.num_traj = len(batch)
         self.traj_lengths = torch.tensor([data.size for data in batch])
 
+        self._set_indices_from_traj()
+
+    def _set_indices_from_traj(
+        self
+    ):
+            
+        """
+        Set `start_indices` and `end_indices` from `traj_lengths`.
+        """
+        
         self.end_indices = torch.cumsum(self.traj_lengths, dim=0)
         self.start_indices = torch.cat((torch.zeros(1,dtype=int), self.end_indices[:-1]))
+
+    def _set_traj_from_indices(
+        self
+    ):
+            
+        """
+        Set `num_traj` and `traj_lengths` from `start_indices` and `end_indices`.
+        """
+        
+        self.num_traj = len(self.start_indices)
+        self.traj_lengths = self.end_indices - self.start_indices
     
     def _build_slices_from_indices(
         self,
@@ -427,8 +447,7 @@ class DataTrajectories:
                 )) for ii in range(self.num_traj)
             ])
             
-            new_data.num_traj = len(new_data.start_indices)
-            new_data.traj_lengths = new_data.end_indices - new_data.start_indices
+            new_data._set_traj_from_indices()
 
         return new_data
 
