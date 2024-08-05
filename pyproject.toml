@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages]
+find = {}  # Scan the project directory with the default parameters
+
+[project]
+name = "bside"
+version = "0.0.1"
+authors = [
+  { name="Nicholas Galioto", email="ngalioto@umich.edu" },
+]
+description = "A Python package for MCMC sampling."
+readme = "README.md"
+dependencies = [
+    "torch"
+]
+license = {file = "LICENSE"}
+keywords = [
+"Bayesian inference",
+"system identification",
+"dynamical systems",
+"dynamics",
+"filtering",
+"DMD",
+"model uncertainty",
+"stochastic dynamics",
+"probabilistic inference"
+]
+classifiers = [
+"Intended Audience :: Science/Research",
+"License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+"Natural Language :: English",
+"Operating System :: OS Independent",
+"Programming Language :: Python :: 3",
+"Topic :: Scientific/Engineering :: Mathematics"
+]
+
+[project.urls]
+Homepage = "https://github.com/ngalioto/bside"
