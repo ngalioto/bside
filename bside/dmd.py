@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 
 from typing import Union
-from dataset import Data, DataTrajectories
+from bside.dataset import Data, DataTrajectories
 
 class DMD:
 

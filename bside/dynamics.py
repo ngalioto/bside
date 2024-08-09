@@ -1,8 +1,8 @@
 import torch
 from torch import Tensor
-import filtering
-from models import Matrix
-from dataset import Data, DataTrajectories
+import bside.filtering as filtering
+from bside.models import Matrix
+from bside.dataset import Data, DataTrajectories
 from abc import ABC, abstractmethod
 from typing import Union, Tuple, Type, Callable
 
