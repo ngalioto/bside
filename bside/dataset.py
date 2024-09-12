@@ -311,7 +311,7 @@ class DataTrajectories:
         """
         
         self.y = torch.cat([data.y for data in batch], dim=0)
-        self.u = torch.cat([data.u for data in batch], dim=0)
+        self.u = torch.cat([data.u for data in batch], dim=0) if batch[0].u is not None else None
 
         self.ydim = self.y.shape[1]
         self.udim = self.u.shape[1]
@@ -375,10 +375,11 @@ class DataTrajectories:
         if self.norm == False:
             self.y_mean = self.y.mean(dim=0)
             self.y_std = self.y.std(dim=0)
-            self.u_mean = self.u.mean(dim=0)
-            self.u_std = self.u.std(dim=0)
             self.y = (self.y - self.y_mean) / self.y_std
-            self.u = (self.u - self.u_mean) / self.u_std
+            if self.u is not None:
+                self.u_mean = self.u.mean(dim=0)
+                self.u_std = self.u.std(dim=0)
+                self.u = (self.u - self.u_mean) / self.u_std
             self.norm = True
 
     def unnormalize(
@@ -391,7 +392,8 @@ class DataTrajectories:
         
         if self.norm == True:
             self.y = self.y * self.y_std + self.y_mean
-            self.u = self.u * self.u_std + self.u_mean
+            if self.u is not None:
+                self.u = self.u * self.u_std + self.u_mean
             self.norm = False
 
     def partition_trajectories(
