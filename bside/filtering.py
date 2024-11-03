@@ -1,28 +1,80 @@
 import torch
 from torch import Tensor
+from torch.linalg import solve_triangular
+from math import log
 
-from typing import Union, Tuple, Type, Callable
+from bside.models import Matrix
+from bside.dynamics import Model, AdditiveModel, LinearModel
+from typing import Union, Tuple
+
+"""
+Consider making children for Gaussian and particle filters
+But maybe the only difference is sample and log_prob?
+For particle filter, use mean_weights for both mean and cov.
+"""
 
 class FilteringDistribution:
 
     def __init__(
         self,
-        mean : Tensor,
-        cov : Tensor,
+        mean : Tensor = None,
+        cov : Tensor = None,
         particles : Tensor = None,
         mean_weights : Tensor = None,
         cov_weights : Tensor = None,
         **hyper_params
     ):
         
+        if particles is None and (mean is None or cov is None):
+            raise ValueError("Both mean and cov must be provided if particles are not provided")
+        
+        if mean is not None:
+            self.dim = mean.shape[-1]
+        else:
+            self.dim = particles.shape[-1]
+        
         self.mean = mean
-        self.dim = mean.shape[-1]
-        self.cov = cov
+        self._cov = Matrix(cov) if type(cov) is not Matrix else cov
         self._particles = particles
         self.size = 0 if particles is None else particles.shape[0]
         self.mean_weights = mean_weights
         self.cov_weights = cov_weights
         self.hyper_params = hyper_params
+
+    @property
+    def cov(
+        self
+    ):
+        return self._cov.val
+    
+    @cov.setter
+    def cov(
+        self,
+        value : Tensor
+    ):
+            
+        self._cov.val = value
+
+    @property
+    def sqrt_cov(
+        self
+    ):
+            
+        return self._cov.sqrt
+    
+    @sqrt_cov.setter
+    def sqrt_cov(
+        self,
+        value : Tensor
+    ):
+                
+        self._cov.sqrt = value
+
+    def update(
+        self
+    ):
+        
+        self._cov.update()
 
     @property
     def particles(
@@ -40,12 +92,33 @@ class FilteringDistribution:
         self._particles = value
         self.size = value.shape[0]
 
+    def log_prob(
+        self,
+        x : Tensor,
+        normalize : bool = True
+    ) -> Tensor:
+        
+        """
+        TODO: What if the distribution is not Gaussian?
+
+        Compute the Gaussian log probability of a given point x
+        """
+
+        v = x - self.mean
+        log_prob = torch.sum(solve_triangular(self.sqrt_cov, v.T, upper=False)**2, axis=0)
+
+        if normalize:
+            log_prob = log_prob + torch.log(torch.linalg.det(self.cov)) + self.dim * log(2*torch.pi)
+
+        return -0.5 * log_prob
+    
+
     def sample(
         self,
         n : int
     ) -> Tensor:
         
-        self.particles = torch.distributions.MultivariateNormal(self.mean, self.cov).sample((n,))
+        self.particles = torch.randn(n, self.dim) @ self.sqrt_cov.T + self.mean
     
     # sigma points for unscented transform
     def ut_points(
@@ -54,7 +127,7 @@ class FilteringDistribution:
         
         n = self.dim
         try:
-            L = torch.linalg.cholesky(self.cov, upper=True)
+            L = self.sqrt_cov   # this might need to be upper triangular
         except torch.linalg.LinAlgError: #P not positive-definite
             xout = None
         else:
@@ -87,89 +160,148 @@ class FilteringDistribution:
         self.cov_weights = Wc
         self.hyper_params["lmbda"] = lmbda
 
-def kalman_update(
-    dist : Type[FilteringDistribution],
+def kalman_gain(
+    dist : FilteringDistribution,
     U : Tensor,
-    v : Tensor,
-    sqrtS : Tensor = None,
-    S : Tensor = None,
     Sinv : Tensor = None
-) -> Type[FilteringDistribution]:
-    
+) -> Tensor:
+
     if Sinv is not None:
         K = U @ Sinv
-    elif S is not None:
-        K = torch.linalg.solve(S, U, left=False)
-    elif sqrtS is not None:
-        K = torch.linalg.solve_triangular(sqrtS, \
-            torch.linalg.solve_triangular(sqrtS, U, upper=False, left=False), \
-                upper=False, left=False)
+    elif not dist._cov._sqrt_up_to_date:
+        # might consider using scipy solve with assume_a='sym'
+        K = torch.linalg.solve(dist.cov, U, left=False)
     else:
-        raise ValueError('Missing argument. Must pass S, sqrtS, or Sinv')
+        K = solve_triangular(
+            dist.sqrt_cov, \
+            solve_triangular(dist.sqrt_cov, U, upper=False, left=False), \
+                upper=False, left=False \
+            )
 
-    dist.mean = dist.mean + torch.squeeze(K @ v)
-    dist.cov = dist.cov - torch.bmm(K, U.transpose(-1,-2))
-    return dist
+    return K
+
+def kalman_update(
+    y : Tensor,
+    dist_x : FilteringDistribution,
+    dist_y : FilteringDistribution,
+    U : Tensor,
+    Sinv : Tensor = None
+) -> FilteringDistribution:
+    
+    K = kalman_gain(dist_y, U, Sinv)
+
+    dist_x.mean = dist_x.mean + K @ (y - dist_y.mean)    #torch.squeeze(K @ v)
+    dist_x.cov = dist_x.cov - K @ U.T                    #torch.bmm(K, U.transpose(-1,-2))
+    return dist_x
 
 def kf_predict(
-    model : Callable,
-    dist : Type[FilteringDistribution],
+    model : LinearModel,
+    dist : FilteringDistribution,
     u : Tensor = None,
     crossCov : bool = False,
-) -> Union[Tuple[Type[FilteringDistribution], Tensor], Type[FilteringDistribution]]:
+) -> Union[Tuple[FilteringDistribution, Tensor], FilteringDistribution]:
     
-    dist.mean = model(dist.mean,u)
     U = dist.cov @ model.mat_x.T
-    dist.cov = model.mat_x @ U + model.noise_cov
+    dist = FilteringDistribution(
+        mean = model(dist.mean, u),
+        cov = model.mat_x @ U + model.noise_cov
+    )
 
     return (dist,U) if crossCov else dist
 
 def enkf_predict(
-    model,
-    dist : Type[FilteringDistribution],
+    model : Model,
+    dist : FilteringDistribution,
     u : Tensor = None,
     crossCov : bool = False
-) -> Union[Tuple[Type[FilteringDistribution], Tensor], Type[FilteringDistribution]]:
+) -> Union[Tuple[FilteringDistribution, Tensor], FilteringDistribution]:
     
-    Y_particles = model.sample(dist.particles,u)
-    dist_Y = FilteringDistribution(
-        mean = torch.mean(dist.particles, dim=0),
-        cov = (dist.particles - dist.mean).T @ (dist.particles - dist.mean) /  \
-        (dist.size - 1),
-        particles = Y_particles
-    )
+    """
+    EnKF predict
 
-    U = dist.cov @ model.mat_x.T
-    dist.cov = model.mat_x @ U + model.noise_cov
+    Parameters
+    ----------
+    model : Model
+        The model to use for prediction
+    dist : FilteringDistribution
+        The distribution to predict
+    u : Tensor, optional
+        The control input, by default None
+    crossCov : bool, optional
+        Whether to return the cross covariance, by default False
+
+    Returns
+    -------
+    Union[Tuple[FilteringDistribution, Tensor], FilteringDistribution]
+        The predicted distribution and the cross covariance `U` if crossCov is True
+
+    """
+    
+    dist_Y = FilteringDistribution(particles=model.sample(dist.particles, u))
+
+    if crossCov:
+        dist_Y.mean = torch.mean(dist_Y.particles, 0)
+        res_Y = dist_Y.particles - dist_Y.mean
+        dist_Y.cov = (res_Y.T @ res_Y) / (dist_Y.size - 1)
+
+        if dist.mean is None:
+            dist.mean = torch.mean(dist.particles, 0)
+        U = ((dist.particles - dist.mean).T @ res_Y) / (dist.size - 1)
 
     return (dist_Y, U) if crossCov else dist_Y
+
+def enkf_update(
+    y : Tensor,
+    dist_x : FilteringDistribution,
+    dist_y : FilteringDistribution,
+    U : Tensor,
+    Sinv : Tensor = None
+) -> FilteringDistribution:
+        
+    v = y - dist_y.particles
+    K = kalman_gain(dist_y, U, Sinv)
+
+    dist_x.particles = dist_x.particles + torch.einsum('ij,bj->bi', K, v)
+
+    # Do not necessarily need the mean and cov for filtering
+    dist_x.mean = None
+    dist_x.cov = None
+
+    return dist_x
     
 
 # Gaussian quadrature
 def gaussian_quadrature(
-    model,
-    dist_X : Type[FilteringDistribution],
+    model : Model,
+    dist_X : FilteringDistribution,
     u : Tensor = None,
     crossCov : bool = False,
-    additive : bool = False
-) -> Union[Tuple[Type[FilteringDistribution], Tensor], Type[FilteringDistribution]]:
+) -> Union[Tuple[FilteringDistribution, Tensor], FilteringDistribution]:
+    
+    additive = type(model) is AdditiveModel
 
-    Y = model(dist_X.particles, u)
+    Y = model(dist_X.particles, u) if additive else model.sample(dist_X.particles, u)
 
     Ymean = torch.sum(Y.T * dist_X.mean_weights, 1, keepdims=True).T
 
-    resY = Y - Ymean
-    P = (resY.T * dist_X.cov_weights) @ resY
+    res_Y = Y - Ymean
+    P = (res_Y.T * dist_X.cov_weights) @ res_Y
     
     if additive:
         P = P + model.noise_cov
 
-    dist_Y = FilteringDistribution(Ymean, P, Y, dist_X.mean_weights, dist_X.cov_weights)
+    dist_Y = FilteringDistribution(
+        mean=Ymean, 
+        cov=P, 
+        particles=Y, 
+        mean_weights=dist_X.mean_weights, 
+        cov_weights=dist_X.cov_weights
+    )
         
     if crossCov:
-        resX = dist_X.particles - \
+        res_X = dist_X.particles - \
             torch.sum(dist_X.particles.T * dist_X.mean_weights, 1, keepdims=True).T
-        U = (resX.T * dist_X.cov_weights) @ resY
+        U = (res_X.T * dist_X.cov_weights) @ res_Y
         return dist_Y, U
     
     else:

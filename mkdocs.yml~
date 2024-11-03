@@ -1,0 +1,5 @@
+site_name: B-Side
+
+nav:
+  - Home: index.md
+  - About: about.md

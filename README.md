@@ -1,2 +1,21 @@
-# B-SIde
-B-SIde is a toolbox for system identification from a Bayesian perspective. The name is an abbreviated form of Bayesian System Identification and alludes to the fact that the current prevailing methods for system identification are derived from the classical, rather than Bayesian, statistical perspective. Therefore, the Bayesian approach can be viewed, to a certain extent, as an alternative (or B-side) to these algorithms.
+# B-Side
+
+A Bayesian system identification toolbox.
+
+## Installation
+
+Install latest release
+```bash
+pip install bside
+```
+
+Alternatively, install from source
+```bash
+pip install git+https://github.com/ngalioto/bside.git
+```
+## Author information
+
+Author: Nicholas Galioto  
+Email: [ngalioto@umich.edu](mailto:ngalioto@umich.edu)  
+License: MIT  
+Copyright 2024, Nicholas Galioto

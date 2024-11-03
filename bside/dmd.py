@@ -242,7 +242,7 @@ class DMDc(DMD):
         elif isinstance(data, DataTrajectories):
             input_indices = torch.cat([torch.arange(data.start_indices[ii], data.end_indices[ii]-1) for ii in range(data.num_traj)])
             output_indices = torch.cat([torch.arange(data.start_indices[ii]+1, data.end_indices[ii]) for ii in range(data.num_traj)])
-            input = torch.cat((data.y[input_indices], data.u[input_indices]), dim=1).T
+            input = torch.cat((data.y[input_indices], data.u[input_indices]), dim=1).T # this is different part
             output = data.y[output_indices].T
         return input, output
     
@@ -286,7 +286,7 @@ class DMDc(DMD):
             self.A = output @ (V.T / S) @ U1.T
             self.B = output @ (V.T / S) @ U2.T
             return torch.mean((output - self.A @ input[:data.ydim] - self.B @ input[data.ydim:])**2)
-        
+
     def test(
         self,
         data : Union[Data, DataTrajectories]

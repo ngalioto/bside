@@ -2,7 +2,7 @@ import numpy as np
 import copy
 import torch
 from torch import Tensor
-from typing import Optional, Tuple, Union, Type, Self, Iterator, List
+from typing import Optional, Tuple, Union, Self, Iterator, List
 
 from numpy import ndarray
 

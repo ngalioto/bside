@@ -20,7 +20,7 @@ class Matrix(torch.nn.Module):
         self.pdim = torch.unique(indices).numel()
 
         # initialize parameters
-        self.params = torch.nn.Parameter(torch.zeros(self.pdim))
+        self.params = torch.nn.Parameter(torch.zeros(self.pdim)) if self.pdim > 0 else None
 
         self._val = self.default.clone()
         self._up_to_date = True
@@ -54,7 +54,7 @@ class Matrix(torch.nn.Module):
     ):
         
         if not self._sqrt_up_to_date:
-            self._sqrt_val = torch.linalg.cholesky(self.val)
+            self._sqrt_val = torch.linalg.cholesky(self.val, upper=False)
             self._sqrt_up_to_date = True
             
         return self._sqrt_val
@@ -67,6 +67,7 @@ class Matrix(torch.nn.Module):
 
         self._sqrt_val = value
         self._sqrt_up_to_date = True
+        self._up_to_date = False
 
     def forward(
         self,
@@ -76,8 +77,15 @@ class Matrix(torch.nn.Module):
         p = self.params if params is None else params
 
         matrix = self.default.clone()
-        matrix[:, self.mask] = p[self.indices]
+        if p is not None:
+            matrix[:, self.mask] = p[self.indices]
         return matrix
+    
+    def update(
+        self
+    ):
+        
+        self.val = self()
     
     def __repr__(
         self
@@ -100,7 +108,7 @@ class SquaredMatrix(Matrix):
     ):
 
         p = self.params ** 2
-        return super().__call__(p)
+        return super().forward(p)
     
 
 class FeedforwardNetwork(torch.nn.Module):
