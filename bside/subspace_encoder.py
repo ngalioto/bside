@@ -1,4 +1,4 @@
-from bside.dynamics import SSM
+from bside.state_space import SSM
 from bside.models import ResidualNetwork
 
 class SubspaceEncoder(SSM):
