@@ -3,6 +3,46 @@ from torch import Tensor
 from bside.models import Matrix
 from abc import ABC, abstractmethod
 
+
+"""
+What if we had classes for linear and nonlinear functions. And then each class has a subclass for additive noise.
+
+No, I think we want the stochastic models to belong to an additive noise class.
+Multiple inheritance
+So additive should can take a deterministic model and a noise_cov
+Or it can take all the arguments of a deterministic model and a noise_cov
+
+class AdditiveModel(Model):
+    def __init__(
+        self,
+        model : Model = None,
+        noise_cov : Matrix = None,
+        *args = None
+    ):
+
+        raise NotImplementedError('This class is not yet implemented')
+
+# Not sure we want this since it puts the model in its own variable
+class LinearGaussianModel(LinearModel, AdditiveModel):
+
+    def __init__(
+        self,
+        model : LinearModel = None,
+        noise_cov : Matrix = None,
+        *args
+    ):
+
+        if model is not None and args is not None:
+            raise ValueError('Cannot specify both a model and arguments for a model')
+
+        if model is not None:
+            self.__dict__.update(model.__dict__)
+        else:
+            super(LinearModel, self).__init__(*args)
+
+        self.noise_cov = noise_cov
+"""
+
 class Model(ABC, torch.nn.Module):
 
     def __init__(
@@ -25,11 +65,9 @@ class Model(ABC, torch.nn.Module):
         pass
 
     @abstractmethod
-    def sample(
-        self,
-        x: Tensor,
-        u: Tensor = None
-    ) -> Tensor:
+    def update(
+        self
+    ):
         
         pass
 
@@ -50,11 +88,15 @@ class Model(ABC, torch.nn.Module):
             state vector. Should be shape (B, d) or (d) where B is the batch size and d is the state dimension.
         u : Tensor, optional
             input vector. Should be shape (T, m), or (m) if T is 1.
+        T : int, optional
+            number of timesteps to run the model forward.
+        keep_x0 : bool, optional
+            if True, the initial state `x` will be included in the output. Otherwise, the output will only include the predicted states.
 
         Returns
         ---------
         Tensor
-            The output of the `T` compositions of the forward model.
+            The output of the `T` compositions of the forward model. Will have `T` timesteps if `keep_x0` is False, and `T+1` timesteps if `keep_x0` is True.
         """
 
         batch = x.ndim > 1
@@ -77,10 +119,6 @@ class Model(ABC, torch.nn.Module):
     
 
 class AdditiveModel(Model):
-
-    """
-    TODO: Add function to run the filter over multiple timesteps.
-    """
 
     def __init__(
         self,
@@ -153,7 +191,7 @@ class AdditiveModel(Model):
         x = self.x if x is None else x
         return torch.randn(N, self.xdim) @ self.sqrt_noise_cov.T + self.forward(x,u)
 
-class LinearModel(AdditiveModel):
+class LinearModel(Model):
     """
     A model that is a linear function of the state and/or inputs. \
         The noise is assumed to be additive Gaussian.
@@ -177,7 +215,6 @@ class LinearModel(AdditiveModel):
     def __init__(
         self,
         mat_x : Matrix,
-        noise_cov : Matrix,
         mat_u : Matrix = None
     ):
         """
@@ -203,20 +240,16 @@ class LinearModel(AdditiveModel):
             if mat_u.val.shape[0] != mat_x.val.shape[0]:
                 raise ValueError('The dimensions of mat_x and mat_u at axis 1 must agree')
 
-        super().__init__(*mat_x.val.shape, noise_cov)
+        super().__init__(*mat_x.val.shape)
 
         self._mat_x = mat_x
         self._mat_u = mat_u
-        self.indices = torch.unique(torch.cat((
-            mat_x.indices,
-            noise_cov.indices
-        ))) # assumes mat_u is known if not None
+        self.indices = torch.unique(mat_x.indices) # assumes mat_u is known if not None
 
     def update(
         self
     ):
         
-        super().update()
         self._mat_x.update()
         self._mat_u.update()
 
@@ -277,6 +310,33 @@ class LinearModel(AdditiveModel):
             x_next = x_next + self.mat_u @ u
 
         return x_next
+
+class LinearGaussianModel(LinearModel, AdditiveModel):
+
+    """
+    A linear model with additive Gaussian noise.
+    """
+
+    def __init__(
+        self,
+        model : LinearModel = None,
+        noise_cov : Matrix = None,
+        *args
+    ):
+
+        if model is not None and args is not None:
+            raise ValueError('Cannot specify both a model and arguments for a model')
+
+        if model is not None:
+            self.__dict__.update(model.__dict__)
+        else:
+            super(LinearModel, self).__init__(*args)
+
+        self.noise_cov = noise_cov
+        self.indices = torch.unique(torch.cat((
+            self.mat_x.indices,
+            self.noise_cov.indices
+        ))) # assumes mat_u is known if not None
     
 class IdentityModel(LinearModel):
 
@@ -286,8 +346,7 @@ class IdentityModel(LinearModel):
     ):
         
         super().__init__(
-            mat_x=Matrix(torch.eye(dim)),
-            noise_cov=Matrix(torch.eye(dim))
+            mat_x=Matrix(torch.eye(dim))
         )
 
     def forward(
@@ -298,7 +357,27 @@ class IdentityModel(LinearModel):
         
         return x
     
-class NonlinearModel(AdditiveModel):
+class NonlinearModel(Model):
+
+    def __init__(
+        self,
+        f : torch.nn.Module,        
+        in_dim : int,
+        out_dim : int
+    ):
+        
+        super().__init__(in_dim, out_dim)
+        self.f = f
+
+    def forward(
+        self,
+        x: Tensor,
+        u: Tensor = None
+    ) -> Tensor:
+        
+        return self.f(x, u)
+    
+class NonlinearAdditiveModel(NonlinearModel, AdditiveModel):
 
     def __init__(
         self,
@@ -308,19 +387,11 @@ class NonlinearModel(AdditiveModel):
         out_dim : int
     ):
         
-        super().__init__(in_dim, out_dim, noise_cov)
-        self.f = f
+        super().__init__(f, in_dim, out_dim)
+        self.noise_cov = noise_cov
 
     def update(
         self
     ):
         
         self.noise_cov.update()
-
-    def forward(
-        self,
-        x: Tensor,
-        u: Tensor = None
-    ) -> Tensor:
-        
-        return self.f(x, u)
