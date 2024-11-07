@@ -140,6 +140,18 @@ class DMD:
         else:
             self.A = output @ (V.T / S) @ U.T
 
+    def test(
+        self,
+        data : Union[Data, DataTrajectories]
+    ) -> Tensor:
+        
+        if not isinstance(data, Data) and not isinstance(data, DataTrajectories):
+            raise ValueError("The data must be an instance of the Data class or DataTrajectories class.")
+        
+        input, output = self.form_snapshot_matrices(data)
+
+        return torch.mean((output - self.A @ input)**2)
+
 class DMDc(DMD):
 
     """
