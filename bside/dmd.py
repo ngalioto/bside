@@ -18,10 +18,6 @@ class DMD:
         The A matrix.
     A_rom : Tensor
         The A matrix for the reduced-order model.
-    data : Dataset
-        The dataset used for training the DMD model.
-    rank : int
-        The rank of the DMD model.
     """
 
     def __init__(
@@ -30,13 +26,6 @@ class DMD:
         
         """
         Initialize the DMD model.
-
-        Parameters
-        ----------
-        data : Dataset
-            The dataset to be used for training the DMD model.
-        rank : int, optional
-            The rank of the DMD model, by default None. Uses maximum rank if None.
         """     
 
         self._A = None
@@ -81,7 +70,7 @@ class DMD:
     def form_snapshot_matrices(
             self, 
             data : Union[Data, DataTrajectories]
-        ):
+    ) -> Union[Tensor, Tensor]:
 
         """
         Form the snapshot matrices for the DMD model.
@@ -105,19 +94,31 @@ class DMD:
             output = data.y[output_indices].T
         return input, output
     
+    def loss(
+        self,
+        input : Tensor,
+        output : Tensor
+    ) -> Tensor:
+        
+        return torch.mean((output - self.A @ input)**2)
+    
 
     def fit(
         self, 
         data : Union[Data, DataTrajectories],
         rank : int = None,
         rom : bool = False
-    ):
+    ) -> Tensor:
         
         """
         Fit the DMD model to the data.
         
         Parameters
         ----------
+        data : Dataset
+            The dataset to be used for training the DMD model.
+        rank : int, optional
+            The rank of the DMD model, by default None. Uses maximum rank if None
         rom : bool, optional
             Whether to compute the reduced-order model, by default False.
         """
@@ -127,6 +128,17 @@ class DMD:
         rank = data.ydim if rank is None else rank
         
         input, output = self.form_snapshot_matrices(data)
+
+        self.estimate_model(input, output, rank, rom)
+        return self.loss(input, output)
+
+    def estimate_model(
+        self,
+        input : Tensor,
+        output : Tensor,
+        rank : int,
+        rom : bool
+    ) -> None:
 
         # Compute the SVD of the input matrix
         U, S, V = torch.linalg.svd(input, full_matrices=False)
@@ -147,10 +159,8 @@ class DMD:
         
         if not isinstance(data, Data) and not isinstance(data, DataTrajectories):
             raise ValueError("The data must be an instance of the Data class or DataTrajectories class.")
-        
-        input, output = self.form_snapshot_matrices(data)
 
-        return torch.mean((output - self.A @ input)**2)
+        return self.loss(*self.form_snapshot_matrices(data))
 
 class DMDc(DMD):
 
@@ -170,10 +180,6 @@ class DMDc(DMD):
         The control input matrix.
     B_rom : Tensor
         The control input matrix for the reduced-order model.
-    data : Dataset
-        The dataset used for training the DMDc model.
-    rank : int
-        The rank of the DMDc model.
     """
 
     def __init__(
@@ -182,13 +188,6 @@ class DMDc(DMD):
         
         """
         Initialize the DMDc model.
-        
-        Parameters
-        ----------
-        data : Dataset
-            The dataset to be used for training the DMDc model.
-        rank : int, optional
-            The rank of the DMDc model, by default None. Uses maximum rank if None.
         """
         
         super().__init__()
@@ -233,12 +232,17 @@ class DMDc(DMD):
         self._B_rom = value
 
     def form_snapshot_matrices(
-            self,
-            data : Union[Data, DataTrajectories]
-        ):
+        self,
+        data : Union[Data, DataTrajectories]
+    ) -> Union[Tensor, Tensor]:
 
         """
         Form the snapshot matrices for the DMDc model.
+
+        Parameters
+        ----------
+        data : Dataset
+            The dataset to be used for training the DMDc model.
 
         Returns
         -------
@@ -258,33 +262,44 @@ class DMDc(DMD):
             output = data.y[output_indices].T
         return input, output
     
+    def loss(
+        self,
+        input : Tensor,
+        output : Tensor
+    ) -> Tensor:
+        
+        ydim = output.shape[0]
+        return torch.mean((output - self.A @ input[:ydim] - self.B @ input[ydim:])**2)
 
-    def fit(
+    def estimate_model(
         self, 
-        data : Union[Data, DataTrajectories],
+        input : Tensor,
+        output : Tensor,
         rank : int = None,
         rom : bool = False
-    ) -> Tensor:
+    ) -> None:
         
         """
         Fit the DMDc model to the data.
         
         Parameters
         ----------
+        input : Tensor
+            The input matrix.
+        output : Tensor
+            The output matrix.
+        rank : int, optional
+            The rank of the DMDc model, by default None. Uses maximum rank if None.
         rom : bool, optional
             Whether to compute the reduced-order model, by default False.
         """
 
-        if not isinstance(data, Data) and not isinstance(data, DataTrajectories):
-            raise ValueError(f"The data must be an instance of the Data class or DataTrajectories class. Instead received {data.__class__.__name__}.")
-        rank = data.ydim if rank is None else rank
-        
-        input, output = self.form_snapshot_matrices(data)
+        ydim = output.shape[0]
 
         # Compute the SVD of the input matrix
         U, S, V = torch.linalg.svd(input, full_matrices=False)
-        U1 = U[:data.ydim, :rank]
-        U2 = U[data.ydim:, :rank]
+        U1 = U[:ydim, :rank]
+        U2 = U[ydim:, :rank]
         S = S[:rank]
         V = V[:rank, :]
 
@@ -297,17 +312,3 @@ class DMDc(DMD):
         else:
             self.A = output @ (V.T / S) @ U1.T
             self.B = output @ (V.T / S) @ U2.T
-            return torch.mean((output - self.A @ input[:data.ydim] - self.B @ input[data.ydim:])**2)
-
-    def test(
-        self,
-        data : Union[Data, DataTrajectories]
-    ) -> Tensor:
-        
-        if not isinstance(data, Data) and not isinstance(data, DataTrajectories):
-            raise ValueError("The data must be an instance of the Data class or DataTrajectories class.")
-        
-        input, output = self.form_snapshot_matrices(data)
-
-        return torch.mean((output - self.A @ input[:data.ydim] - self.B @ input[data.ydim:])**2)
-    
