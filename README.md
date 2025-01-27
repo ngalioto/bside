@@ -18,4 +18,4 @@ pip install git+https://github.com/ngalioto/bside.git
 Author: Nicholas Galioto  
 Email: [ngalioto@umich.edu](mailto:ngalioto@umich.edu)  
 License: MIT  
-Copyright 2024, Nicholas Galioto
+Copyright 2025, Nicholas Galioto
