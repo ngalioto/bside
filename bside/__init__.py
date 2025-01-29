@@ -2,9 +2,9 @@
 
 from bside.dataset import DataTrajectories, Data
 from bside.dmd import DMD, DMDc
-from bside.dynamics import Model, AdditiveModel, LinearModel, NonlinearModel, IdentityModel
-from bside.filtering.distributions import FilteringDistribution
-from bside.models import FeedforwardNetwork, ResidualNetwork
+from bside.dynamics import Model, AdditiveModel, LinearModel, NonlinearModel, IdentityModel, NonlinearAdditiveModel, LinearGaussianModel
+from bside.filtering import *
+from bside.models import FeedforwardNetwork, ResidualNetwork, PSDMatrix, Matrix, SquaredMatrix, ExponentialMatrix, DiagonalMatrix
 from bside.state_space import SSM, HMM
 from bside.subspace_encoder import SubspaceEncoder
 
@@ -15,14 +15,20 @@ __all__ = (
     "DataTrajectories",
     "DMD",
     "DMDc",
+    "DiagonalMatrix",
+    "ExponentialMatrix",
     "FeedforwardNetwork",
-    "FilteringDistribution",
+    "HMM",
     "IdentityModel",
+    "LinearGaussianModel",
     "LinearModel",
+    "Matrix",
     "Model",
+    "NonlinearAdditiveModel",
     "NonlinearModel",
+    "PSDMatrix",
     "ResidualNetwork",
     "SSM",
-    "HMM",
+    "SquaredMatrix",
     "SubspaceEncoder"
 )
