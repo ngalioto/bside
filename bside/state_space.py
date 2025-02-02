@@ -1,6 +1,5 @@
 import torch
 from torch import Tensor
-import bside.filtering as filtering
 from bside.dynamics import Model, IdentityModel
 from bside.dataset import Data, DataTrajectories
 from typing import Union, Tuple, Callable
@@ -64,6 +63,20 @@ class SSM(torch.nn.Module):
         y = self.observations(x)
 
         return y if not return_x else (x, y)
+    
+    def measure(
+        self,
+        x : Tensor,
+        u : Tensor = None,
+        T : int = 1,
+        return_x : bool = False,
+        keep_y0 : bool = False
+    ):
+        
+        x = self.dynamics.predict(x, u, T, keep_x0=keep_y0)
+        y = self.observations.sample(x, N=(T + keep_y0))
+
+        return y if not return_x else (x, y)
 
     
     def forward(
@@ -73,6 +86,8 @@ class SSM(torch.nn.Module):
     ) -> Tensor:
         
         """
+        TODO: very nice but add to multiple shooting function
+
         Compute the output of the SSM given the input data.
 
         If you want to use this to predict from a single initial condition, run `forward()`
@@ -193,9 +208,11 @@ class SSM(torch.nn.Module):
         shuffle : bool = True,
         ms_batching : bool = False,
         **optim_kwargs
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> Tensor | Tuple[Tensor, Tensor]:
         
         """
+        TODO: This can be chopped up and distributed. Make multiple shooting its own loss function.
+
         Parameters
         ----------
         epochs : int, optional
@@ -288,29 +305,36 @@ class SSM(torch.nn.Module):
 class HMM(SSM):
 
     """
+    TODO: this is going to get replaced by a Filter
+
     A hidden Markov model (HMM) that is defined by a dynamics model and an observation model. \
         The dynamics model is a function that maps the state vector to the next state vector, and the observation model is a function that maps the state vector to the observation vector.
     """
 
     def __init__(
         self,
-        init_dist : filtering.FilteringDistribution,
+        xdim : int,
+        ydim : int,
         dynamics : Model,
-        observations : Model,
-        u : Tensor = None
+        observations : Model
     ):
         
-        super().__init__(dynamics, observations)
-        self.init_dist = init_dist
-        self.u = u
+        super().__init__(
+            xdim = xdim, 
+            ydim = ydim, 
+            dynamics = dynamics, 
+            observations = observations
+        )
 
-    def update(
+    def sample(
         self
     ):
         
-        self.init_dist.update()
-        self.dynamics.update()
-        self.observations.update()
+        """
+        TODO: Draw samples from the dynamics.
+        """
+        
+        pass
     
     def forward(
         self,
@@ -342,6 +366,8 @@ class HMM(SSM):
         
         """
         NOTE: This does not run properly yet.
+        TODO: This will be moved into filtering subpackage
+        TODO: y0 and data frequency should all be stored in Data object
 
         TODO: How to handle the data.u depending on y0. Might have to change data structure.
         If y0 is False, then we need one more u than y.
@@ -357,38 +383,39 @@ class HMM(SSM):
         Returns
         -------
         Tensor
-            The log marginal likelihood of the data given the model $\\log p(\mathcal{Y}_n | \\theta)$.
+            The log marginal likelihood of the data given the model $\\log p(\\mathcal{Y}_n | \\theta)$.
         """
         
-        T = data.size
+        pass
+        # T = data.size
 
-        x_dist = self.init_dist.copy()
+        # x_dist = self.init_dist.copy()
 
-        if not y0:
-            x_dist = self.dynamics.filter(
-                x_dist, 
-                data.u[0] if data.u is not None else None
-            )
-            if x_dist is None:
-                return torch.tensor([-torch.inf])
+        # if not y0:
+        #     x_dist = self.dynamics.filter(
+        #         x_dist, 
+        #         data.u[0] if data.u is not None else None
+        #     )
+        #     if x_dist is None:
+        #         return torch.tensor([-torch.inf])
 
-        for t in range(0 if y0 else 1, T):
-            y_dist, U = self.observations.filter(
-                x_dist, 
-                data.u[t] if data.u is not None else None, 
-                crossCov=True
-            )
+        # for t in range(0 if y0 else 1, T):
+        #     y_dist, U = self.observations.filter(
+        #         x_dist, 
+        #         data.u[t] if data.u is not None else None, 
+        #         crossCov=True
+        #     )
 
-            log_prob = y_dist.log_prob(data.y[t])
+        #     log_prob = y_dist.log_prob(data.y[t])
 
-            if t < T-1:
-                # need an update that will also work for particle methods
-                x_dist = filtering.kalman_update(data.y[t], x_dist, y_dist, U)
-                x_dist = self.dynamics.filter(
-                    x_dist, 
-                    data.u[t+1] if data.u is not None else None
-                )
-                if x_dist is None:
-                    return torch.tensor([-torch.inf])
+        #     if t < T-1:
+        #         # need an update that will also work for particle methods
+        #         x_dist = kalman_update(data.y[t], x_dist, y_dist, U)
+        #         x_dist = self.dynamics.filter(
+        #             x_dist, 
+        #             data.u[t+1] if data.u is not None else None
+        #         )
+        #         if x_dist is None:
+        #             return torch.tensor([-torch.inf])
                 
-        return log_prob
+        # return log_prob

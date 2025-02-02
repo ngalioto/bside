@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 from torch.linalg import solve_triangular
 
-from bside.filtering.distributions import FilteringDistribution
+from bside.filtering import FilteringDistribution
 from bside.dynamics import Model, AdditiveModel, LinearGaussianModel
 
 
@@ -41,8 +41,8 @@ def kalman_update(
     
     K = kalman_gain(dist_y, U, Sinv)
 
-    dist_x.mean = dist_x.mean + K @ (y - dist_y.mean)    #torch.squeeze(K @ v)
-    dist_x.cov = dist_x.cov - K @ U.T                    #torch.bmm(K, U.transpose(-1,-2))
+    dist_x.mean = dist_x.mean + torch.einsum('...ij, ...j -> ...i', K, (y - dist_y.mean))
+    dist_x.cov = dist_x.cov - K @ U.T
     return dist_x
 
 def kf_predict(
@@ -51,7 +51,7 @@ def kf_predict(
     u: Tensor = None,
     crossCov: bool = False,
 ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-    
+
     U = dist.cov @ model.mat_x.T
     dist = FilteringDistribution(
         mean = model(dist.mean, u),
@@ -144,9 +144,9 @@ def gaussian_quadrature(
 
     Y = model(dist_X.particles, u) if additive else model.sample(dist_X.particles, u)
 
-    Ymean = torch.sum(Y.T * dist_X.mean_weights, 1, keepdims=True).T
+    Ymean = torch.sum(Y.T * dist_X.mean_weights, dim=1, keepdims=False)
 
-    res_Y = Y - Ymean
+    res_Y = Y - Ymean.unsqueeze(-2)
     P = (res_Y.T * dist_X.cov_weights) @ res_Y
     
     if additive:

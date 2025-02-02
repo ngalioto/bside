@@ -1,49 +1,16 @@
 import torch
 from torch import Tensor
-from bside.models import Matrix
+from bside.models import Matrix, PSDMatrix
 from abc import ABC, abstractmethod
+from typing import Callable
+import warnings
 
 
 """
-What if we had classes for linear and nonlinear functions. And then each class has a subclass for additive noise.
-
-No, I think we want the stochastic models to belong to an additive noise class.
-Multiple inheritance
-So additive should can take a deterministic model and a noise_cov
-Or it can take all the arguments of a deterministic model and a noise_cov
-
-class AdditiveModel(Model):
-    def __init__(
-        self,
-        model : Model = None,
-        noise_cov : Matrix = None,
-        *args = None
-    ):
-
-        raise NotImplementedError('This class is not yet implemented')
-
-# Not sure we want this since it puts the model in its own variable
-class LinearGaussianModel(LinearModel, AdditiveModel):
-
-    def __init__(
-        self,
-        model : LinearModel = None,
-        noise_cov : Matrix = None,
-        *args
-    ):
-
-        if model is not None and args is not None:
-            raise ValueError('Cannot specify both a model and arguments for a model')
-
-        if model is not None:
-            self.__dict__.update(model.__dict__)
-        else:
-            super(LinearModel, self).__init__(*args)
-
-        self.noise_cov = noise_cov
+The building blocks for creating a (possibly stochastic) dynamical system.
 """
 
-class Model(ABC, torch.nn.Module):
+class Model(torch.nn.Module, ABC):
 
     def __init__(
         self,
@@ -101,12 +68,13 @@ class Model(ABC, torch.nn.Module):
 
         batch = x.ndim > 1
 
-        if u.ndim == 1:
-            u = u.unsqueeze(0)
-        elif u.shape[0] < T:
-            raise ValueError(f'{T} timesteps specified, but only {u.shape[0]} inputs provided')
+        if u is not None:
+            if u.ndim == 1:
+                u = u.unsqueeze(0)
+            elif u.shape[0] < T:
+                raise ValueError(f'{T} timesteps specified, but only {u.shape[0]} inputs provided')
 
-        x_out = torch.zeros(x.shape[0] if batch else 1, T, self.ydim)
+        x_out = torch.zeros(x.shape[0] if batch else 1, T+1, self.out_dim)
         x_out[:, 0] = x.clone()
 
         for ii in range(T):
@@ -118,21 +86,44 @@ class Model(ABC, torch.nn.Module):
         return x_out if batch else x_out.squeeze(0)
     
 
+    def sample(
+        self,
+        x : Tensor,
+        u : Tensor = None,
+        N : int = 1
+    ) -> Tensor:
+        
+        warnings.warn('The model is deterministic, so calling `sample` is equivalent to calling `forward`', UserWarning)
+        
+        return self.forward(x, u)
+
 class AdditiveModel(Model):
+
+    """
+    Only uses the first two moments of noise since these are the only moments used in Gaussian filters.
+    """
 
     def __init__(
         self,
-        in_dim : int,
-        out_dim : int,
-        noise_cov : Matrix
+        model : Model,
+        noise_cov : PSDMatrix,
+        **kwargs
     ):
         
-        super().__init__(in_dim, out_dim)
+        if model is not None and kwargs:
+            raise ValueError('Cannot specify both a model and arguments for a model')
 
+        # Build the model
+        if model is not None:
+            self.__dict__.update(model.__dict__)
+        else:
+            super().__init__(**kwargs)
+
+        # Add the noise covariance
         if type(noise_cov) is Tensor:
-            noise_cov = Matrix(noise_cov)
-        elif type(noise_cov) is not Matrix:
-            raise ValueError(f'`noise_cov` must be a Tensor or Matrix, but received {type(noise_cov)}')
+            noise_cov = PSDMatrix(noise_cov)
+        elif type(noise_cov) is not PSDMatrix:
+            raise ValueError(f'`noise_cov` must be a Tensor or PSDMatrix, but received {type(noise_cov)}')
         
         self._noise_cov = noise_cov
 
@@ -157,7 +148,7 @@ class AdditiveModel(Model):
         
         self._noise_cov.update()
 
-    """Not sure we need the next three methods"""
+    """Not sure we need the next two methods"""
     @property
     def sqrt_noise_cov(
         self
@@ -172,44 +163,19 @@ class AdditiveModel(Model):
     ):
         self._noise_cov.sqrt = value
 
-    def _update_sqrt(
-        self
-    ):
-        """
-        Need some way to handle when Parameters are updated without using the setter
-        """
-        
-        self.sqrt_noise_cov = torch.linalg.cholesky(self.noise_cov, upper=False)
-
     def sample(
         self,
-        N : int = 1,
         x : Tensor = None,
-        u : Tensor = None
+        u : Tensor = None,
+        N : int = 1
     ) -> Tensor:
         
         x = self.x if x is None else x
-        return torch.randn(N, self.xdim) @ self.sqrt_noise_cov.T + self.forward(x,u)
+        return torch.randn(N, self.out_dim) @ self.sqrt_noise_cov.T + self.forward(x,u)
 
 class LinearModel(Model):
     """
-    A model that is a linear function of the state and/or inputs. \
-        The noise is assumed to be additive Gaussian.
-
-    Attributes
-    ---------
-    xdim : int
-        Input dimension of the model
-    ydim : int
-        Output dimension of the model
-    mat_x : Tensor
-        A matrix that will be applied to the state within the model
-    mat_u : Tensor
-        A matrix that will be applied to the input within the model. If the model does not use inputs, this attribute will be set as `None`
-    noise_cov : Tensor
-        The covariance matrix of the additive noise term in the model. This matrix must be symmetric positive-definite
-    sqrt_noise_cov : Tensor
-        The lower Cholesky decomposition of `noise_cov`. This will be useful for sampling and evaluating log pdfs.
+    A linear model.
     """
 
     def __init__(
@@ -224,8 +190,6 @@ class LinearModel(Model):
         ---------
         mat_x : Tensor
             matrix that transforms the state vector
-        noise_cov : Tensor
-            noise covariance matrix. Must be symmetric positive-definite.
         mat_u : Tensor, optional
             matrix that transforms the input vector
         """
@@ -240,7 +204,10 @@ class LinearModel(Model):
             if mat_u.val.shape[0] != mat_x.val.shape[0]:
                 raise ValueError('The dimensions of mat_x and mat_u at axis 1 must agree')
 
-        super().__init__(*mat_x.val.shape)
+        super().__init__(
+            in_dim=mat_x.val.shape[1],
+            out_dim=mat_x.val.shape[0]
+        )
 
         self._mat_x = mat_x
         self._mat_u = mat_u
@@ -304,14 +271,14 @@ class LinearModel(Model):
             The output of the forward model without noise.
         """
 
-        x_next = torch.einsum('ij,bj->bi', self.mat_x, x)
+        x_next = torch.einsum('...ij,...j->...i', self.mat_x, x)
 
         if self._mat_u is not None and u is not None:
             x_next = x_next + self.mat_u @ u
 
         return x_next
 
-class LinearGaussianModel(LinearModel, AdditiveModel):
+class LinearGaussianModel(AdditiveModel, LinearModel):
 
     """
     A linear model with additive Gaussian noise.
@@ -320,23 +287,11 @@ class LinearGaussianModel(LinearModel, AdditiveModel):
     def __init__(
         self,
         model : LinearModel = None,
-        noise_cov : Matrix = None,
-        *args
+        noise_cov : PSDMatrix = None,
+        **kwargs
     ):
 
-        if model is not None and args is not None:
-            raise ValueError('Cannot specify both a model and arguments for a model')
-
-        if model is not None:
-            self.__dict__.update(model.__dict__)
-        else:
-            super(LinearModel, self).__init__(*args)
-
-        self.noise_cov = noise_cov
-        self.indices = torch.unique(torch.cat((
-            self.mat_x.indices,
-            self.noise_cov.indices
-        ))) # assumes mat_u is known if not None
+        super().__init__(model, noise_cov, **kwargs)
     
 class IdentityModel(LinearModel):
 
@@ -366,7 +321,7 @@ class NonlinearModel(Model):
         out_dim : int
     ):
         
-        super().__init__(in_dim, out_dim)
+        Model.__init__(self, in_dim, out_dim)
         self.f = f
 
     def forward(
@@ -374,24 +329,17 @@ class NonlinearModel(Model):
         x: Tensor,
         u: Tensor = None
     ) -> Tensor:
-        
+
         return self.f(x, u)
     
-class NonlinearAdditiveModel(NonlinearModel, AdditiveModel):
+class NonlinearAdditiveModel(AdditiveModel, NonlinearModel):
 
     def __init__(
         self,
-        f : torch.nn.Module,
-        noise_cov : Matrix,
+        f : Callable[[Tensor, Tensor], Tensor],
+        noise_cov : PSDMatrix,
         in_dim : int,
         out_dim : int
     ):
         
-        super().__init__(f, in_dim, out_dim)
-        self.noise_cov = noise_cov
-
-    def update(
-        self
-    ):
-        
-        self.noise_cov.update()
+        super().__init__(None, noise_cov, f=f, in_dim=in_dim, out_dim=out_dim)

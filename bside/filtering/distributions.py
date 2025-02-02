@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 from torch.linalg import solve_triangular
-from math import log
+from math import log, sqrt
 
 from bside.models import PSDMatrix
 
@@ -99,11 +99,11 @@ class FilteringDistribution:
     @particles.setter
     def particles(
         self,
-        value: Tensor
+        value: Tensor | None
     ) -> None:
             
         self._particles = value
-        self.size = value.shape[0]
+        self.size =value.shape[0] if value is not None else 0
 
     def log_prob(
         self,
@@ -117,7 +117,7 @@ class FilteringDistribution:
         Compute the Gaussian log probability of a given point x
         """
 
-        v = x - self.mean
+        v = torch.atleast_2d(x - self.mean)
         log_prob = torch.sum(solve_triangular(self.sqrt_cov, v.T, upper=False)**2, axis=-2) # Mahalanobis distance
 
         if normalize:
@@ -153,12 +153,12 @@ class FilteringDistribution:
         
         n = self.dim
         try:
-            L = self.sqrt_cov   # this might need to be upper triangular
+            L = self.sqrt_cov
         except torch.linalg.LinAlgError: #P not positive-definite
             xout = None
         else:
-            scaling = torch.sqrt(n + lmbda)
-            scaledL = L*scaling
+            scaling = sqrt(n + lmbda)
+            scaledL = L * scaling
             xout = torch.zeros(2 * n + 1, n)
             xout[0] = self.mean
             xout[1:n+1] = self.mean + scaledL
@@ -170,10 +170,11 @@ class FilteringDistribution:
         self,
         alpha: float,
         beta: float,
-        kappa: float
+        kappa: float,
+        lmbda: float | None = None
     ) -> None:
         
-        lmbda = torch.tensor([alpha**2 * (self.dim + kappa) - self.dim])
+        lmbda = alpha**2 * (self.dim + kappa) - self.dim if lmbda is None else lmbda
         Wm = torch.zeros(2 * self.dim + 1)
         Wc = torch.zeros(2 * self.dim + 1)
 

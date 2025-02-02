@@ -6,12 +6,9 @@ from abc import ABC, abstractmethod
 
 from bside.dynamics import Model, LinearGaussianModel
 
-# this is why Filter is in its own file. Otherwise, we would have a circular import since SSM imports FilteringDistribution
 from bside.state_space import SSM, HMM
-
 from bside.dataset import Data
-from bside.filtering.distributions import FilteringDistribution
-from bside.filtering import functional as F
+from bside.filtering import FilteringDistribution, functional as F
 
 """
 TODO: Need to add particle filter and various Gaussian quadratures
@@ -77,7 +74,8 @@ class UnscentedKalmanPredict(FilterPredict):
         crossCov: bool = False
     ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
         
-        dist.form_ut_points(self.lmbda)
+        if dist.particles is None:
+            dist.form_ut_points(self.lmbda)
         return F.gaussian_quadrature(model, dist, u, crossCov)
 
 class FilterUpdate(ABC):
@@ -106,6 +104,22 @@ class KalmanUpdate(FilterUpdate):
     ) -> FilteringDistribution:
         
         return F.kalman_update(y, dist_x, dist_y, U, Sinv)
+    
+class UnscentedKalmanUpdate(FilterUpdate):
+
+    def __call__(
+        self,
+        y: Tensor,
+        dist_x: FilteringDistribution,
+        dist_y: FilteringDistribution,
+        U: Tensor,
+        Sinv: Tensor | None = None
+    ) -> FilteringDistribution:
+        
+        # We can keep the weights, but the UT points will be outdated
+        dist_x.particles = None
+        return F.kalman_update(y, dist_x, dist_y, U, Sinv)
+
     
 class EnsembleKalmanUpdate(FilterUpdate):
 
@@ -141,21 +155,19 @@ class Filter(ABC):
         data: Data,
         init_dist: FilteringDistribution,
         y0: bool = False,
-        obs_freq: int | Tensor | None = None,
-        return_history: bool = False
+        return_history: bool = False,
+        compute_log_prob: bool = False
     ) -> FilteringDistribution | List[FilteringDistribution]:
         
-        if obs_freq is None:
-            obs_freq = torch.ones(1, dtype=torch.int) if obs_freq is None else obs_freq
-        elif isinstance(obs_freq, int):
-            obs_freq = obs_freq * torch.ones(1, dtype=torch.int)
         T = len(data)
         self.dist = init_dist
 
         if return_history:
-            state_estimates = []
+            state_estimates = [copy.deepcopy(self.dist)]
 
-        # log_prob = 0.0
+        if compute_log_prob:
+            log_prob = 0.0
+        
         if y0:
             y_dist, U = self.observations_filter(
                 self.model,
@@ -163,27 +175,39 @@ class Filter(ABC):
                 data.u[t] if data.u is not None else None,
                 crossCov=True
             )
-            # log_prob += y_dist.log_prob(data.y[t])
+            
+            if compute_log_prob:
+                log_prob += y_dist.log_prob(data.y[t])
+
             self.dist = self.update(data.y[t], self.dist, y_dist, U)
+
             if return_history:
                 state_estimates.append(copy.deepcopy(self.dist))
-
-        # obs_freq = obs_freq.expand(T) if len(obs_freq) == 1 else obs_freq
 
         for t in range(1 if y0 else 0, T):
-            self.dist = self.dynamics_filter(data.u[t] if data.u is not None else None)
+            self.dist = self.dynamics_filter(
+                model=self.model.dynamics,
+                dist=self.dist,
+                u=data.u[t-1] if data.u is not None else None,
+                crossCov=False
+            )
+
             y_dist, U = self.observations_filter(
-                self.dist, 
-                data.u[t] if data.u is not None else None,
+                model=self.model.observations,
+                dist=self.dist,
+                u=data.u[t] if data.u is not None else None,
                 crossCov=True
             )
-            # log_prob += y_dist.log_prob(data.y[t])
+
+            if compute_log_prob:
+                log_prob += y_dist.log_prob(data.y[t])
+
             self.dist = self.update(data.y[t], self.dist, y_dist, U)
             if return_history:
                 state_estimates.append(copy.deepcopy(self.dist))
 
-        return state_estimates if return_history else self.dist
-        # return (state_estimates if return_history else self.dist, log_prob)
+        output = state_estimates if return_history else self.dist
+        return (output, log_prob) if compute_log_prob else output
     
 
 class KalmanFilter(Filter):
@@ -194,9 +218,9 @@ class KalmanFilter(Filter):
     ) -> None:
         
         if not isinstance(model.dynamics, LinearGaussianModel):
-            raise ValueError(f"Kalman filter requires a linear Gaussian model, but {type(model.dynamics)=}")
+            raise ValueError(f"Kalman filter requires a linear Gaussian model, but dynamics are type {type(model.dynamics)}")
         if not isinstance(model.observations, LinearGaussianModel):
-            raise ValueError(f"Kalman filter requires a linear Gaussian model, but {type(model.observations)=}")
+            raise ValueError(f"Kalman filter requires a linear Gaussian model, but observations are type {type(model.observations)}")
         
         super().__init__(
             model = model,
@@ -225,7 +249,7 @@ class UnscentedKalmanFilter(Filter):
             model = model,
             dynamics_filter = UnscentedKalmanPredict(lmbda),
             observations_filter = UnscentedKalmanPredict(lmbda),
-            update = KalmanUpdate()
+            update = UnscentedKalmanUpdate()
         )
 
     def filter(
@@ -233,18 +257,18 @@ class UnscentedKalmanFilter(Filter):
         data: Data,
         init_dist: FilteringDistribution,
         y0: bool = False,
-        obs_freq: int | Tensor | None = None,
-        return_history: bool = False
+        return_history: bool = False,
+        compute_log_prob: bool = False
     ) -> FilteringDistribution | List[FilteringDistribution]:
     
         init_dist.form_ut_weights(
-            n = self.model.xdim,
             alpha = self.alpha,
             beta = self.beta,
-            kappa = self.kappa
+            kappa = self.kappa,
+            lmbda = self.lmbda
         )
 
-        return super().filter(data, init_dist, y0, obs_freq, return_history)
+        return super().filter(data, init_dist, y0, return_history, compute_log_prob)
 
 class EnsembleKalmanFilter(Filter):
 

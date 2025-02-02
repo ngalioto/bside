@@ -10,14 +10,34 @@ class Matrix(torch.nn.Module):
         indices: Tensor = torch.empty(0)
     ):
         
+        """
+        Initialize a matrix object.
+
+        Parameters
+        ----------
+        default : Tensor
+            Default matrix values.
+        mask : Tensor, optional
+            Mask for the matrix, by default None. If mask value is True, the matrix entry is a learnable parameter.
+        indices : Tensor, optional
+            Indices of the learnable parameters, by default torch.empty(0).
+        """
+        
         super().__init__()
 
-        if mask is not None and default.shape != mask.shape:
-            raise ValueError(f'Matrix shape must match `mask` shape, but got shapes {default.shape} and {mask.shape}')
+        if mask is not None:
+            if default.shape != mask.shape:
+                raise ValueError(f'Matrix shape must match `mask` shape, but got shapes {default.shape} and {mask.shape}')
+            if mask.sum() != indices.numel():
+                raise ValueError(f'The number of parameter indices must match the number of learnable matrix entries determined by `mask`, but got {indices.numel()} parameter indices and {mask.sum()} learnable entries')
+        elif indices.numel() > 0:
+            raise ValueError('Parameter indices were provided but the matrix does not contain learnable entries.')
+            
         self.default = default
+        self._shape = default.shape
         self.mask = mask
         self.indices = indices
-        self.pdim = torch.unique(indices).numel()
+        self.pdim = torch.numel(torch.unique(indices))
 
         # initialize parameters
         self.params = torch.nn.Parameter(torch.zeros(self.pdim)) if self.pdim > 0 else None
@@ -26,6 +46,20 @@ class Matrix(torch.nn.Module):
         self._inv_val = None
         self._inv_up_to_date = False
 
+    @property
+    def shape(
+        self
+    ) -> tuple[int]:
+
+        return self._shape
+    
+    @shape.setter
+    def shape(
+        self,
+        value: tuple[int]
+    ) -> None:
+
+        raise ValueError('Setting the shape of an object `Matrix` is not allowed')
 
     @property
     def val(
@@ -41,6 +75,9 @@ class Matrix(torch.nn.Module):
     ) -> None:
 
         self._val = value
+        self._shape = value.shape
+
+        self._inv_up_to_date = False
 
     @property
     def inv(
@@ -68,7 +105,10 @@ class Matrix(torch.nn.Module):
         Compute the inverse of the matrix without storing it.
         """
         
-        return torch.linalg.inv(self.val)
+        try:
+            return torch.linalg.inv(self.val)
+        except:
+            raise ValueError('Matrix is not invertible')
 
     def forward(
         self,
@@ -96,19 +136,34 @@ class Matrix(torch.nn.Module):
     
 class PSDMatrix(Matrix):
 
+    """
+    TODO: Need to allow this to be just a square root for efficiency
+
+    Positive semi-definite matrix class.
+    """
+
     def __init__(
         self,
-        default: Tensor,
+        default: Tensor | None = None,
+        default_sqrt: Tensor | None = None,
         mask: Tensor | None = None,
-        indices: Tensor = torch.empty(0)
+        indices: Tensor = torch.empty(0),
+        sqrt_only: bool = False
     ) -> None:
+
+        if default_sqrt is not None:
+            if not torch.isclose(default_sqrt, torch.tril(default_sqrt)):
+                raise ValueError('Default square root matrix must be lower triangular')
+            else:
+                self._sqrt_val = default_sqrt
+        elif default is not None:
+            self._sqrt_val = torch.linalg.cholesky(default, upper=False)
 
         super().__init__(default, mask, indices)
 
-        self._up_to_date = True
+        self._up_to_date = False
 
-        self._sqrt_val = None
-        self._sqrt_up_to_date = False
+        self._sqrt_up_to_date = True
 
         self._inv_val = None
         self._inv_up_to_date = False
@@ -149,7 +204,7 @@ class PSDMatrix(Matrix):
     ) -> Tensor:
         
         if not self._sqrt_up_to_date:
-            self._sqrt_val = torch.linalg.cholesky(self.val, upper=False)
+            self._sqrt_val = self.compute_sqrt()
             self._sqrt_up_to_date = True
             
         return self._sqrt_val
@@ -214,6 +269,36 @@ class SquaredMatrix(Matrix):
         p = self.params ** 2
         return super().forward(p)
     
+class DiagonalMatrix(Matrix):
+    """
+    TODO: Make init that checks default is diagonal and mask is diagonal
+    """
+    def compute_sqrt(
+        self
+    ) -> None:
+        
+        """
+        Compute the Cholesky decomposition of the matrix without storing it.
+        """
+        
+        try:
+            return torch.sqrt(self.val)
+        except:
+            raise ValueError('Matrix is not positive semi-definite')
+        
+    def compute_inv(
+        self
+    ) -> None:
+        
+        """
+        Compute the inverse of the matrix without storing it.
+        """
+        
+        try:
+            return 1.0 / self.val
+        except:
+            raise ValueError('Matrix is not invertible')
+        
 
 class FeedforwardNetwork(torch.nn.Module):
 
@@ -255,7 +340,6 @@ class FeedforwardNetwork(torch.nn.Module):
             x = layer(x)
         return x
     
-
 class ResidualNetwork(torch.nn.Module):
 
     def __init__(
