@@ -2,26 +2,29 @@ import numpy as np
 import copy
 import torch
 from torch import Tensor
-from typing import Optional, Tuple, Union, Self, Iterator, List
+from typing import Tuple, Self, Iterator, List
 
 from numpy import ndarray
 
 class Data:
 
     """
+    TODO: Edit to allow y and u at different timesteps
+    NOTE: always assume we have u at the same time point as y (for the output function)
+
     A class for storing data in the form of a PyTorch tensor.
     
     Attributes
     ----------
-    y : Tensor
+    y: Tensor
         The state data.
-    u : Optional[Tensor]
+    u: Optional[Tensor]
         The control input data. None if no control input is available.
-    ydim : int
+    ydim: int
         The state dimension of the data.
-    udim : int
+    udim: int
         The control input dimension of the data. 0 if no control input is available.
-    size : int
+    size: int
         The number of samples in the data.
 
     Methods
@@ -38,16 +41,16 @@ class Data:
 
     def __init__(
         self,
-        y: Union[Tensor, ndarray] = None, 
-        u: Optional[Union[Tensor, ndarray]] = None
-    ):        
+        y: Tensor | ndarray | None = None,
+        u: Tensor | ndarray | None = None
+    ) -> None:        
         
         """
         Parameters
         ----------
-        y : Union[Tensor, ndarray], optional
+        y: Tensor | ndarray | None = None, optional
             The state data, by default None
-        u : Optional[Union[Tensor, ndarray]], optional
+        u: Tensor | ndarray | None = None, optional
             The control input data, by default None
         
         Raises
@@ -76,11 +79,10 @@ class Data:
                 self.u = torch.tensor(u, dtype=torch.float32) if isinstance(u, ndarray) else u
 
                 if self.u.ndim == 1:
-                    self.u = self.u[...,None]
+                    self.u = self.u.unsqueeze(1)
                 self.udim = self.u.shape[1]
                 if self.u.shape[0] != self.size:
-                    raise ValueError("There must be exactly one fewer " +
-                                        "control input sample than state sample.")
+                    raise ValueError("There must be the same number of samples in the state and control input data.")
             else:
                 self.u = None
                 self.udim = 0
@@ -95,14 +97,14 @@ class Data:
 
     def __iter__(
         self
-    ) -> Union[Iterator[Tensor], Iterator[Tuple[Tensor, Tensor]]]:
+    ) -> Iterator[Tensor] | Iterator[Tuple[Tensor, Tensor]]:
 
         """
         Return an iterator over a combined tuple of (y, u) if u is available,
 
         Returns
         -------
-        Union[Iterator[Tensor], Iterator[Tuple[Tensor, Tensor]]]
+        Iterator[Tensor] | Iterator[Tuple[Tensor, Tensor]]:
             An iterator over the data.
         """
 
@@ -129,8 +131,8 @@ class Data:
         return self.size
 
     def __getitem__(
-            self, 
-            index : Union[int, slice]
+        self, 
+        index: int | slice
     ) -> Self:
 
         """
@@ -138,7 +140,7 @@ class Data:
         
         Parameters
         ----------
-        index : Union[int, slice]
+        index: int | slice
             The index or slice to be used for indexing.
         
         Returns
@@ -181,27 +183,27 @@ class DataTrajectories:
 
     Attributes
     ----------
-    y : Tensor
+    y: Tensor
         The state data.
-    u : Tensor
+    u: Tensor
         The control input data.
-    ydim : int
+    ydim: int
         The state dimension of the data.
-    udim : int
+    udim: int
         The control input dimension of the data.
-    num_traj : int
+    num_traj: int
         The number of trajectories in the dataset.
-    traj_lengths : Tensor
+    traj_lengths: Tensor
         The lengths of the trajectories in the dataset.
-    max_length : int
+    max_length: int
         The length of the longest trajectory in the dataset.
-    min_length : int
+    min_length: int
         The length of the shortest trajectory in the dataset.
-    start_indices : Tensor
+    start_indices: Tensor
         The start indices of the trajectories in the dataset.
-    end_indices : Tensor
+    end_indices: Tensor
         The end indices of the trajectories in the dataset.
-    index : int
+    index: int
         The current index of the trajectory iterator.
 
     Methods
@@ -226,16 +228,16 @@ class DataTrajectories:
 
     def __init__(
         self,
-        filename : str = None,
-        batch : List[Data] = None
-    ):
+        filename: str = None,
+        batch: List[Data] = None
+    ) -> None:
         
         """
         Parameters
         ----------
-        filename : str, optional
+        filename: str, optional
             The filename of the dataset, by default None
-        batch : List[Data], optional
+        batch: List[Data], optional
             A list of Data objects, by default None
 
         Raises
@@ -266,15 +268,15 @@ class DataTrajectories:
 
     def _init_from_filename(
         self,
-        filename : str
-    ): 
+        filename: str
+    ) -> None: 
         
         """
         Initialize the dataset from a file.
 
         Parameters
         ----------
-        filename : str
+        filename: str
             The filename of the dataset.
         """
         
@@ -298,15 +300,15 @@ class DataTrajectories:
 
     def _init_from_batch(
         self,
-        batch : List[Data]
-    ):
+        batch: List[Data]
+    ) -> None:
         
         """
         Initialize the dataset from a list of Data objects.
 
         Parameters
         ----------
-        batch : List[Data]
+        batch: List[Data]
             A list of Data objects.
         """
         
@@ -323,7 +325,7 @@ class DataTrajectories:
 
     def _set_indices_from_traj(
         self
-    ):
+    ) -> None:
             
         """
         Set `start_indices` and `end_indices` from `traj_lengths`.
@@ -334,7 +336,7 @@ class DataTrajectories:
 
     def _set_traj_from_indices(
         self
-    ):
+    ) -> None:
             
         """
         Set `num_traj` and `traj_lengths` from `start_indices` and `end_indices`.
@@ -345,7 +347,7 @@ class DataTrajectories:
     
     def _build_slices_from_indices(
         self,
-        traj_indices : Tensor
+        traj_indices: Tensor
     ) -> List[slice]:
         
         """
@@ -353,7 +355,7 @@ class DataTrajectories:
 
         Parameters
         ----------
-        traj_indices : Tensor
+        traj_indices: Tensor
             The trajectory indices.
 
         Returns
@@ -366,7 +368,7 @@ class DataTrajectories:
     
     def normalize(
         self
-    ):
+    ) -> None:
 
         """
         Normalizes the data. If the data is already normalized, this function does nothing.
@@ -384,7 +386,7 @@ class DataTrajectories:
 
     def unnormalize(
         self
-    ):
+    ) -> None:
         
         """
         Unnormalizes the data. If the data is not normalized, this function does nothing.
@@ -398,8 +400,8 @@ class DataTrajectories:
 
     def partition_trajectories(
         self,
-        T : int,
-        history_length : int = 1
+        T: int,
+        history_length: int = 1
     ) -> Self:
         
         """
@@ -407,9 +409,9 @@ class DataTrajectories:
         
         Parameters
         ----------
-        T : int
+        T: int
             The length of the new trajectories.
-        history_length : int, optional
+        history_length: int, optional
             The length of the history to be included in each new trajectory, by default 1
         
         Returns
@@ -496,7 +498,7 @@ class DataTrajectories:
     
     def __getitem__(
         self,
-        index : Union[int, slice]
+        index: int | slice
     ) -> Data:
         
         """
@@ -504,7 +506,7 @@ class DataTrajectories:
 
         Parameters
         ----------
-        index : Union[int, slice]
+        index: int | slice
             The index or slice to be used for indexing.
 
         Returns
@@ -570,15 +572,15 @@ class DataTrajectories:
     @traj_lengths.setter
     def traj_lengths(
         self,
-        value : Tensor
-    ):
+        value: Tensor
+    ) -> None:
         
         """
         Set the lengths of the trajectories in the dataset and updates the max and min lengths variables.
 
         Parameters
         ----------
-        value : Tensor
+        value: Tensor
             The lengths of the trajectories in the dataset.
         """
         
@@ -605,15 +607,15 @@ class DataTrajectories:
     @max_length.setter
     def max_length(
         self,
-        value : int
-    ):
+        value: int
+    ) -> None:
         
         """
         Settter for max_length.
         
         Parameters
         ----------
-        value : int
+        value: int
             The maximum trajectory length.
             
         Raises
@@ -643,15 +645,15 @@ class DataTrajectories:
     @min_length.setter
     def min_length(
         self,
-        value : int
-    ):
+        value: int
+    ) -> None:
         
         """
         Setter for min_length.
 
         Parameters
         ----------
-        value : int
+        value: int
             The minimum trajectory length.
 
         Raises
