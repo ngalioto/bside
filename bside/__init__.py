@@ -5,7 +5,7 @@ from bside.dmd import DMD, DMDc
 from bside.dynamics import Model, AdditiveModel, LinearModel, NonlinearModel, IdentityModel, NonlinearAdditiveModel, LinearGaussianModel
 from bside.filtering import *
 from bside.models import FeedforwardNetwork, ResidualNetwork, PSDMatrix, Matrix, SquaredMatrix, ExponentialMatrix, DiagonalMatrix
-from bside.state_space import SSM, HMM
+from bside.ssm import SSM
 from bside.subspace_encoder import SubspaceEncoder
 
 
@@ -18,7 +18,6 @@ __all__ = (
     "DiagonalMatrix",
     "ExponentialMatrix",
     "FeedforwardNetwork",
-    "HMM",
     "IdentityModel",
     "LinearGaussianModel",
     "LinearModel",

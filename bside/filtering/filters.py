@@ -4,9 +4,9 @@ import copy
 from typing import Tuple, List
 from abc import ABC, abstractmethod
 
+from bside.ssm import SSM
 from bside.dynamics import Model, LinearGaussianModel
 
-from bside.state_space import SSM, HMM
 from bside.dataset import Data
 from bside.filtering import FilteringDistribution, functional as F
 
@@ -138,7 +138,7 @@ class Filter(ABC):
 
     def __init__(
         self,
-        model: HMM,
+        model: SSM,
         dynamics_filter: FilterPredict | None = None,
         observations_filter: FilterPredict | None = None,
         update: FilterUpdate | None = None
@@ -214,7 +214,7 @@ class KalmanFilter(Filter):
 
     def __init__(
         self,
-        model: HMM
+        model: SSM
     ) -> None:
         
         if not isinstance(model.dynamics, LinearGaussianModel):
@@ -233,7 +233,7 @@ class UnscentedKalmanFilter(Filter):
 
     def __init__(
         self,
-        model: HMM,
+        model: SSM,
         alpha: float = 1.0,
         beta: float = 2.0,
         kappa: float = 0.0
@@ -274,7 +274,7 @@ class EnsembleKalmanFilter(Filter):
 
     def __init__(
         self,
-        model: HMM,
+        model: SSM,
         ensemble_size: int
     ) -> None:
         
