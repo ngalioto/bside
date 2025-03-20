@@ -34,6 +34,9 @@ class Matrix(torch.nn.Module):
             raise ValueError('Parameter indices were provided but the matrix does not contain learnable entries.')
             
         self.default = default
+        self._val = self.default.clone()
+        self._inv_val = None
+        self._inv_up_to_date = False
         self._shape = default.shape
         self.mask = mask
         self.indices = indices
@@ -41,10 +44,9 @@ class Matrix(torch.nn.Module):
 
         # initialize parameters
         self.params = torch.nn.Parameter(torch.zeros(self.pdim)) if self.pdim > 0 else None
-
-        self._val = self.default.clone()
-        self._inv_val = None
-        self._inv_up_to_date = False
+        if self.pdim > 0:
+            self.params.data = self.default[self.mask]
+        self.update()
 
     @property
     def shape(
@@ -119,7 +121,7 @@ class Matrix(torch.nn.Module):
 
         matrix = self.default.clone()
         if p is not None:
-            matrix[:, self.mask] = p[self.indices]
+            matrix[self.mask] = p[self.indices]
         return matrix
     
     def update(

@@ -218,7 +218,8 @@ class LinearModel(Model):
     ):
         
         self._mat_x.update()
-        self._mat_u.update()
+        if self._mat_u is not None:
+            self._mat_u.update()
 
 
     @property
@@ -292,6 +293,15 @@ class LinearGaussianModel(AdditiveModel, LinearModel):
     ):
 
         super().__init__(model, noise_cov, **kwargs)
+
+    def update(
+        self
+    ):
+        
+        self._mat_x.update()
+        self._noise_cov.update()
+        if self._mat_u is not None:
+            self._mat_u.update()
     
 class IdentityModel(LinearModel):
 
