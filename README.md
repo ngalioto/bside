@@ -6,16 +6,18 @@
 
 # B-Side
 
-A Bayesian system identification toolbox.
+A Bayesian system identification toolbox. 
+
+This is an ongoing work in progress to which I dedicate a portion of my personal time.
 
 ## Installation
 
-Install latest release
+Install from PyPi
 ```bash
 pip install bside
 ```
 
-Alternatively, install from source
+Alternatively, install from source to get the latest version
 ```bash
 pip install git+https://github.com/ngalioto/bside.git
 ```
