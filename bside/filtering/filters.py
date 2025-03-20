@@ -209,6 +209,23 @@ class Filter(ABC):
         output = state_estimates if return_history else self.dist
         return (output, log_prob) if compute_log_prob else output
     
+    def nlog_marginal_likelihood(
+        self,
+        data: Data,
+        init_dist: FilteringDistribution,
+        y0: bool = False
+    ) -> Tensor:
+        
+        _, logprob = self.filter(
+            data = data, 
+            init_dist = init_dist, 
+            y0 = y0,
+            return_history=False,
+            compute_log_prob=True
+        )
+
+        return -logprob
+    
 
 class KalmanFilter(Filter):
 
