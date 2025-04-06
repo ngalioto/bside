@@ -1,9 +1,6 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages]
-find = {}  # Scan the project directory with the default parameters
 
 [project]
 name = "bside"
@@ -11,12 +8,15 @@ version = "0.0.1"
 authors = [
   { name="Nicholas Galioto", email="ngalioto@umich.edu" },
 ]
-description = "A Python package for MCMC sampling."
+description = "Bayesian system identification toolbox"
 readme = "README.md"
 dependencies = [
-    "torch"
+    "torch",
+    "numpy",
+    "scipy"
 ]
-license = {file = "LICENSE"}
+requires-python = ">= 3.8"
+license = { text = "MIT" }
 keywords = [
 "Bayesian inference",
 "system identification",
@@ -30,7 +30,7 @@ keywords = [
 ]
 classifiers = [
 "Intended Audience :: Science/Research",
-"License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+"License :: OSI Approved :: MIT License",
 "Natural Language :: English",
 "Operating System :: OS Independent",
 "Programming Language :: Python :: 3",
