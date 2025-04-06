@@ -144,7 +144,7 @@ def gaussian_quadrature(
 
     Y = model(dist_X.particles, u) if additive else model.sample(dist_X.particles, u)
 
-    Ymean = torch.sum(Y.T * dist_X.mean_weights, dim=1, keepdims=False)
+    Ymean = torch.sum(Y * dist_X.mean_weights.unsqueeze(-1), dim=0, keepdims=False)
 
     res_Y = Y - Ymean.unsqueeze(-2)
     P = (res_Y.T * dist_X.cov_weights) @ res_Y
@@ -156,6 +156,7 @@ def gaussian_quadrature(
         mean=Ymean, 
         cov=P, 
         particles=Y,
+        quad_points=dist_X.quad_points,
         mean_weights=dist_X.mean_weights,
         cov_weights=dist_X.cov_weights
     )

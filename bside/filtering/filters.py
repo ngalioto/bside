@@ -64,6 +64,7 @@ class UnscentedKalmanPredict(FilterPredict):
         lmbda: float = 1.0,
     ) -> None:
         
+        super().__init__()
         self.lmbda = lmbda
 
     def __call__(
@@ -76,6 +77,26 @@ class UnscentedKalmanPredict(FilterPredict):
         
         if dist.particles is None:
             dist.form_ut_points(self.lmbda)
+        return F.gaussian_quadrature(model, dist, u, crossCov)
+    
+class GaussHermitePredict(FilterPredict):
+
+    def __init__(
+        self
+    ) -> None:
+        
+        super().__init__()
+
+    def __call__(
+        self,
+        model: Model,
+        dist: FilteringDistribution,
+        u: Tensor = None,
+        crossCov: bool = False
+    ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
+        
+        if dist.particles is None:
+            dist.form_gh_points()
         return F.gaussian_quadrature(model, dist, u, crossCov)
 
 class FilterUpdate(ABC):
@@ -105,7 +126,7 @@ class KalmanUpdate(FilterUpdate):
         
         return F.kalman_update(y, dist_x, dist_y, U, Sinv)
     
-class UnscentedKalmanUpdate(FilterUpdate):
+class GaussQuadKalmanUpdate(FilterUpdate):
 
     def __call__(
         self,
@@ -116,7 +137,7 @@ class UnscentedKalmanUpdate(FilterUpdate):
         Sinv: Tensor | None = None
     ) -> FilteringDistribution:
         
-        # We can keep the weights, but the UT points will be outdated
+        # We can keep the weights, but the quadrature points will be outdated
         dist_x.particles = None
         return F.kalman_update(y, dist_x, dist_y, U, Sinv)
 
@@ -160,7 +181,7 @@ class Filter(ABC):
     ) -> FilteringDistribution | List[FilteringDistribution]:
         
         T = len(data)
-        self.dist = init_dist
+        self.dist = copy.copy(init_dist)
 
         if return_history:
             state_estimates = [copy.deepcopy(self.dist)]
@@ -266,7 +287,7 @@ class UnscentedKalmanFilter(Filter):
             model = model,
             dynamics_filter = UnscentedKalmanPredict(lmbda),
             observations_filter = UnscentedKalmanPredict(lmbda),
-            update = UnscentedKalmanUpdate()
+            update = GaussQuadKalmanUpdate()
         )
 
     def filter(
@@ -278,11 +299,45 @@ class UnscentedKalmanFilter(Filter):
         compute_log_prob: bool = False
     ) -> FilteringDistribution | List[FilteringDistribution]:
     
+        init_dist = copy.copy(init_dist)
         init_dist.form_ut_weights(
             alpha = self.alpha,
             beta = self.beta,
             kappa = self.kappa,
             lmbda = self.lmbda
+        )
+
+        return super().filter(data, init_dist, y0, return_history, compute_log_prob)
+    
+class GaussHermiteFilter(Filter):
+
+    def __init__(
+        self,
+        model: SSM,
+        order: int = 3
+    ) -> None:
+        
+        self.order = order
+
+        super().__init__(
+            model = model,
+            dynamics_filter = GaussHermitePredict(),
+            observations_filter = GaussHermitePredict(),
+            update = GaussQuadKalmanUpdate()
+        )
+
+    def filter(
+        self,
+        data: Data,
+        init_dist: FilteringDistribution,
+        y0: bool = False,
+        return_history: bool = False,
+        compute_log_prob: bool = False
+    ) -> FilteringDistribution | List[FilteringDistribution]:
+
+        init_dist = copy.copy(init_dist)
+        init_dist.form_gh_weights(
+            order = self.order
         )
 
         return super().filter(data, init_dist, y0, return_history, compute_log_prob)

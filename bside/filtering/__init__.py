@@ -17,11 +17,14 @@ from .filters import (
     Filter,
     FilterPredict,
     FilterUpdate,
-    UnscentedKalmanPredict,
+    GaussHermiteFilter,
+    GaussHermitePredict,
+    GaussQuadKalmanUpdate,
     KalmanFilter,
     KalmanPredict,
     KalmanUpdate,
     UnscentedKalmanFilter,
+    UnscentedKalmanPredict
 )
 
 from . import functional
@@ -36,6 +39,9 @@ __all__ = [
     'FilterPredict',
     'FilterUpdate',
     'FilteringDistribution',
+    'GaussHermiteFilter',
+    'GaussHermitePredict',
+    'GaussQuadKalmanUpdate',
     'KalmanFilter',
     'KalmanPredict',
     'KalmanUpdate',

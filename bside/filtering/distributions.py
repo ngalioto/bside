@@ -1,7 +1,8 @@
 import torch
 from torch import Tensor
 from torch.linalg import solve_triangular
-from math import log, sqrt
+from numpy.polynomial.hermite import hermgauss
+from math import log, sqrt, pi
 
 from bside.models import PSDMatrix
 
@@ -18,6 +19,7 @@ class FilteringDistribution:
         mean: Tensor = None,
         cov: Tensor = None,
         particles: Tensor = None,
+        quad_points: Tensor = None,
         mean_weights: Tensor = None,
         cov_weights: Tensor = None,
         **hyper_params
@@ -34,6 +36,7 @@ class FilteringDistribution:
         self.mean = mean
         self._cov = PSDMatrix(cov) if type(cov) is not PSDMatrix else cov
         self._particles = particles
+        self.quad_points = quad_points
         self.size = 0 if particles is None else particles.shape[0]
         self.mean_weights = mean_weights
         self.cov_weights = cov_weights
@@ -154,16 +157,15 @@ class FilteringDistribution:
         n = self.dim
         try:
             L = self.sqrt_cov
-        except torch.linalg.LinAlgError: #P not positive-definite
-            xout = None
+        except torch.linalg.LinAlgError: # self.cov is not positive-definite
+            self.particles = None
         else:
             scaling = sqrt(n + lmbda)
             scaledL = L * scaling
-            xout = torch.zeros(2 * n + 1, n)
-            xout[0] = self.mean
-            xout[1:n+1] = self.mean + scaledL
-            xout[n+1:] = self.mean - scaledL
-        self.particles = xout
+            self.particles = torch.zeros(2 * n + 1, n)
+            self.particles[0] = self.mean
+            self.particles[1:n+1] = self.mean + scaledL
+            self.particles[n+1:] = self.mean - scaledL
 
     # weights for unscented transform
     def form_ut_weights(
@@ -173,6 +175,10 @@ class FilteringDistribution:
         kappa: float,
         lmbda: float | None = None
     ) -> None:
+        
+        """
+        When alpha=1, beta=2, kappa=0, this reduces to spherical Gaussian quadrature.
+        """
         
         lmbda = alpha**2 * (self.dim + kappa) - self.dim if lmbda is None else lmbda
         Wm = torch.zeros(2 * self.dim + 1)
@@ -184,3 +190,38 @@ class FilteringDistribution:
         Wc[1:] = 1 / (2 * (self.dim + lmbda))
         self.mean_weights = Wm
         self.cov_weights = Wc
+
+    # sigma points for unscented transform
+    def form_gh_points(
+        self
+    ) -> None:
+        
+        try:
+            L = self.sqrt_cov
+        except torch.linalg.LinAlgError: # self.cov not positive-definite
+            self.particles = None
+        else:
+            scaledL = sqrt(2) * L
+            self.particles = self.quad_points @ scaledL.T + self.mean
+
+    # weights and untransformed points for Gauss-Hermite quadrature
+    def form_gh_weights(
+        self,
+        order: int = 3
+    ) -> None:
+        
+        nodes, weights = hermgauss(deg=order)
+        nodes = torch.from_numpy(nodes).float()
+        weights = torch.from_numpy(weights).float() / sqrt(pi)
+
+        # Grid of shape (order^dim, dim)
+        mesh = torch.meshgrid([nodes] * self.dim, indexing='ij')
+        points = torch.stack(mesh, dim=-1).reshape(-1, self.dim)
+
+        # Weight grid of shape (order^dim,)
+        weight_mesh = torch.meshgrid([weights] * self.dim, indexing='ij')
+        weight_grid = torch.prod(torch.stack(weight_mesh, dim=-1), dim=-1).reshape(-1)
+
+        self.quad_points = points
+        self.mean_weights = weight_grid
+        self.cov_weights = weight_grid
