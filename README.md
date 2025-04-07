@@ -21,6 +21,22 @@ Alternatively, install from source to get the latest version
 ```bash
 pip install git+https://github.com/ngalioto/bside.git
 ```
+
+## Citation
+If you find any portion of this repository useful for your own work, please consider citing this [paper](https://link.springer.com/article/10.1007/s11071-020-05925-8):
+```bibtex
+@article{galioto2020bayesian,
+  title={Bayesian system {ID}: optimal management of parameter, model, and measurement uncertainty},
+  author={Galioto, Nicholas and Gorodetsky, Alex Arkady},
+  journal={Nonlinear Dynamics},
+  volume={102},
+  number={1},
+  pages={241--267},
+  year={2020},
+  publisher={Springer}
+}
+```
+
 ## Author information
 
 Author: Nicholas Galioto  
