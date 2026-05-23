@@ -1,7 +1,31 @@
 site_name: B-Side
+site_description: Bayesian system identification toolbox built on PyTorch.
+repo_url: https://github.com/ngalioto/bside
 
 nav:
   - Home: index.md
+  - Algorithms: algorithms.md
   - About: about.md
 
-theme: readthedocs
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            docstring_style: numpy
+            show_source: false
