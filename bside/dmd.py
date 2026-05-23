@@ -59,11 +59,11 @@ class DMD:
                                "Please first call the method fit(rom=True).")
         return self._A_rom
     
-    @A.setter
+    @A_rom.setter
     def A_rom(
         self, 
         value : Tensor
-    ) -> Tensor:
+    ) -> None:
         
         self._A_rom = value
 
@@ -146,11 +146,13 @@ class DMD:
         S = S[:rank]
         V = V[:rank, :]
 
-        # Approximate the A matrix
+        # `V.T / S` avoids forming a dense Sigma^-1 matrix
+        VTinvS = V.T / S
+
         if rom:
-            self.A_rom = U.T @ output @ (V.T / S)
+            self.A_rom = U.T @ output @ VTinvS
         else:
-            self.A = output @ (V.T / S) @ U.T
+            self.A = output @ VTinvS @ U.T
 
     def test(
         self,
@@ -223,11 +225,11 @@ class DMDc(DMD):
                                "Please first call the method fit(rom=True).")
         return self._B_rom
     
-    @B.setter
+    @B_rom.setter
     def B_rom(
         self, 
         value : Tensor
-    ) -> Tensor:
+    ) -> None:
         
         self._B_rom = value
 
@@ -285,7 +287,7 @@ class DMDc(DMD):
         Parameters
         ----------
         input : Tensor
-            The input matrix.
+            The input matrix (stacked state, control).
         output : Tensor
             The output matrix.
         rank : int, optional
@@ -303,12 +305,14 @@ class DMDc(DMD):
         S = S[:rank]
         V = V[:rank, :]
 
-        # Approximate the A and B matrices
+        # `V.T / S` avoids forming a dense Sigma^-1 matrix
+        VTinvS = V.T / S
+
         if rom:
-            Uhat, _, _ = torch.linalg.svd(output)
+            Uhat, _, _ = torch.linalg.svd(output, full_matrices=False)
             Uhat = Uhat[:, :rank]
-            # self.A_rom = Uhat.T @ output @ (V.T / S) @ U1.T @ Uhat
-            # self.B_rom = Uhat.T @ output @ (V.T / S) @ U2.T
+            self.A_rom = Uhat.T @ output @ VTinvS @ U1.T @ Uhat
+            self.B_rom = Uhat.T @ output @ VTinvS @ U2.T
         else:
-            self.A = output @ (V.T / S) @ U1.T
-            self.B = output @ (V.T / S) @ U2.T
+            self.A = output @ VTinvS @ U1.T
+            self.B = output @ VTinvS @ U2.T

@@ -117,7 +117,7 @@ class Matrix(torch.nn.Module):
         params: Tensor | None = None
     ):
 
-        p = self.params if params is None else params
+        p = self.params if params is None or self.mask is None else params
 
         matrix = self.default.clone()
         if p is not None:
@@ -125,10 +125,11 @@ class Matrix(torch.nn.Module):
         return matrix
     
     def update(
-        self
+        self,
+        params: Tensor | None = None
     ) -> None:
         
-        self.val = self()
+        self.val = self(params)
     
     def __repr__(
         self
@@ -139,9 +140,12 @@ class Matrix(torch.nn.Module):
 class PSDMatrix(Matrix):
 
     """
-    TODO: Need to allow this to be just a square root for efficiency
-
     Positive semi-definite matrix class.
+
+    Can be constructed from either a dense PSD matrix (``default``) or a lower-triangular
+    Cholesky factor (``default_sqrt``). The dense matrix and its Cholesky factor are cached
+    and re-computed lazily; whichever representation is freshest is used to avoid redundant
+    work in downstream filters.
     """
 
     def __init__(
@@ -153,28 +157,35 @@ class PSDMatrix(Matrix):
         sqrt_only: bool = False
     ) -> None:
 
+        if default is None and default_sqrt is None:
+            raise ValueError('Must provide either `default` or `default_sqrt`.')
+
         if default_sqrt is not None:
-            if not torch.isclose(default_sqrt, torch.tril(default_sqrt)):
+            if not torch.allclose(default_sqrt, torch.tril(default_sqrt)):
                 raise ValueError('Default square root matrix must be lower triangular')
-            else:
-                self._sqrt_val = default_sqrt
+            self._sqrt_val = default_sqrt
+            if default is None:
+                # Materialize the dense form once so the Matrix base class has shape/default
+                # to work with. Downstream operations still prefer the cached Cholesky factor.
+                default = default_sqrt @ default_sqrt.T
         elif default is not None:
             self._sqrt_val = torch.linalg.cholesky(default, upper=False)
 
         super().__init__(default, mask, indices)
 
-        self._up_to_date = False
-
+        self.sqrt_only = sqrt_only
+        self._up_to_date = True
         self._sqrt_up_to_date = True
 
         self._inv_val = None
         self._inv_up_to_date = False
 
     def update(
-        self
+        self,
+        params: Tensor | None = None
     ) -> None:
         
-        self.val = self()
+        self.val = self(params)
         self._up_to_date = True
         self._sqrt_up_to_date = False
         self._inv_up_to_date = False
@@ -258,48 +269,72 @@ class ExponentialMatrix(Matrix):
 
     def forward(
         self,
+        params: Tensor | None = None
     ) -> Tensor:
 
-        return torch.linalg.matrix_exp(super().forward())
+        return torch.linalg.matrix_exp(super().forward(params))
     
 class SquaredMatrix(Matrix):
 
     def forward(
         self,
+        params: Tensor | None = None
     ) -> Tensor:
 
-        p = self.params ** 2
-        return super().forward(p)
+        p = self.params if params is None or self.mask is None else params
+        if p is None:
+            return self.default.clone()
+        return super().forward(p ** 2)
     
-class DiagonalMatrix(Matrix):
+class DiagonalMatrix(PSDMatrix):
     """
-    TODO: Make init that checks default is diagonal and mask is diagonal
+    Diagonal positive semi-definite matrix. Stores values densely but takes the
+    cheaper diagonal path for square root and inverse computations.
     """
+
+    def __init__(
+        self,
+        default: Tensor | None = None,
+        default_sqrt: Tensor | None = None,
+        mask: Tensor | None = None,
+        indices: Tensor = torch.empty(0),
+        sqrt_only: bool = False
+    ) -> None:
+
+        if default is not None and default.ndim == 2:
+            if not torch.allclose(default, torch.diag(torch.diagonal(default))):
+                raise ValueError('`default` must be a diagonal matrix for DiagonalMatrix.')
+        if mask is not None and mask.ndim == 2:
+            if not torch.equal(mask, torch.diag(torch.diagonal(mask))):
+                raise ValueError('`mask` must be diagonal for DiagonalMatrix.')
+
+        super().__init__(default, default_sqrt, mask, indices, sqrt_only)
+
     def compute_sqrt(
         self
-    ) -> None:
+    ) -> Tensor:
         
         """
-        Compute the Cholesky decomposition of the matrix without storing it.
+        Diagonal square root: sqrt of the diagonal entries placed back on the diagonal.
         """
         
-        try:
-            return torch.sqrt(self.val)
-        except:
+        diag = torch.diagonal(self.val)
+        if torch.any(diag < 0):
             raise ValueError('Matrix is not positive semi-definite')
+        return torch.diag(torch.sqrt(diag))
         
     def compute_inv(
         self
-    ) -> None:
+    ) -> Tensor:
         
         """
-        Compute the inverse of the matrix without storing it.
+        Diagonal inverse: reciprocal of the diagonal entries placed back on the diagonal.
         """
         
-        try:
-            return 1.0 / self.val
-        except:
+        diag = torch.diagonal(self.val)
+        if torch.any(diag == 0):
             raise ValueError('Matrix is not invertible')
+        return torch.diag(1.0 / diag)
         
 
 class FeedforwardNetwork(torch.nn.Module):

@@ -185,16 +185,17 @@ class SSM(torch.nn.Module):
         return loss_fctn(outputs, data.y[target_idx])
     
     def update(
-        self
+        self,
+        params : Tensor | None = None
     ):
         
         """
         Map the updated parameters into structured matrices (Matrix).
         """
 
-        self.encoder.update()
-        self.dynamics.update()
-        self.observations.update()
+        self.encoder.update(params)
+        self.dynamics.update(params)
+        self.observations.update(params)
     
     def fit(
         self,

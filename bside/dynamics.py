@@ -33,7 +33,8 @@ class Model(torch.nn.Module, ABC):
 
     @abstractmethod
     def update(
-        self
+        self,
+        params: Tensor | None = None
     ):
         
         pass
@@ -120,9 +121,9 @@ class AdditiveModel(Model):
             super().__init__(**kwargs)
 
         # Add the noise covariance
-        if type(noise_cov) is Tensor:
+        if isinstance(noise_cov, Tensor):
             noise_cov = PSDMatrix(noise_cov)
-        elif type(noise_cov) is not PSDMatrix:
+        elif not isinstance(noise_cov, PSDMatrix):
             raise ValueError(f'`noise_cov` must be a Tensor or PSDMatrix, but received {type(noise_cov)}')
         
         self._noise_cov = noise_cov
@@ -143,10 +144,11 @@ class AdditiveModel(Model):
         self._noise_cov.val = value
 
     def update(
-        self
+        self,
+        params: Tensor | None = None
     ):
         
-        self._noise_cov.update()
+        self._noise_cov.update(params)
 
     """Not sure we need the next two methods"""
     @property
@@ -165,13 +167,23 @@ class AdditiveModel(Model):
 
     def sample(
         self,
-        x : Tensor = None,
+        x : Tensor,
         u : Tensor = None,
-        N : int = 1
+        N : int | None = None
     ) -> Tensor:
         
-        x = self.x if x is None else x
-        return torch.randn(N, self.out_dim) @ self.sqrt_noise_cov.T + self.forward(x,u)
+        """
+        Draw a sample of the additive noise model: ``f(x, u) + eta`` with ``eta ~ N(0, Q)``.
+
+        If ``N`` is None, draws one independent noise sample per row of ``x`` (the
+        usual case for ensemble / particle propagation). If ``N`` is provided, draws
+        ``N`` total samples (broadcasting the deterministic part across them).
+        """
+        
+        if N is None:
+            N = x.shape[0] if x.ndim > 1 else 1
+        noise = torch.randn(N, self.out_dim) @ self.sqrt_noise_cov.T
+        return noise + self.forward(x, u)
 
 class LinearModel(Model):
     """
@@ -214,12 +226,13 @@ class LinearModel(Model):
         self.indices = torch.unique(mat_x.indices) # assumes mat_u is known if not None
 
     def update(
-        self
+        self,
+        params: Tensor | None = None
     ):
         
-        self._mat_x.update()
+        self._mat_x.update(params)
         if self._mat_u is not None:
-            self._mat_u.update()
+            self._mat_u.update(params)
 
 
     @property
@@ -295,13 +308,14 @@ class LinearGaussianModel(AdditiveModel, LinearModel):
         super().__init__(model, noise_cov, **kwargs)
 
     def update(
-        self
+        self,
+        params: Tensor | None = None
     ):
         
-        self._mat_x.update()
-        self._noise_cov.update()
+        self._mat_x.update(params)
+        self._noise_cov.update(params)
         if self._mat_u is not None:
-            self._mat_u.update()
+            self._mat_u.update(params)
     
 class IdentityModel(LinearModel):
 

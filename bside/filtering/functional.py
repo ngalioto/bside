@@ -88,18 +88,10 @@ def enkf_predict(
 
     """
     
-    if isinstance(model, LinearGaussianModel):
-        # TODO: Add this in properly and allow for the computation of just square root for efficiency
-        # This will reduce variance of estimate
-        # should just sample noise values ig
-        # dist_Y = FilteringDistribution(
-        #     mean = model(dist.mean, u),
-        #     sqrt_noise_cov = model.mat_x @ dist.sqrt_noise_cov
-        # )
-        # dist_Y.sqrt_cov = None
-        pass
-    else:
-        dist_Y = FilteringDistribution(particles=model.sample(dist.particles, u))
+    # `AdditiveModel.sample` (used for both linear and nonlinear additive cases)
+    # returns deterministic forward + Gaussian noise sample per particle. We delegate
+    # to it so the same code path works for any Gaussian noise model.
+    dist_Y = FilteringDistribution(particles=model.sample(dist.particles, u))
 
     if crossCov:
         dist_Y.mean = torch.mean(dist_Y.particles, 0)

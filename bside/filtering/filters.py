@@ -5,10 +5,35 @@ from typing import Tuple, List
 from abc import ABC, abstractmethod
 
 from bside.ssm import SSM
-from bside.dynamics import Model, LinearGaussianModel
+from bside.dynamics import Model, LinearGaussianModel, IdentityModel, LinearModel
+from bside.models import PSDMatrix
 
 from bside.dataset import Data
 from bside.filtering import FilteringDistribution, functional as F
+
+
+def _ensure_linear_gaussian(
+    model: Model,
+    dim: int,
+    eps: float = 1e-12
+) -> LinearGaussianModel:
+    """
+    Wrap an `IdentityModel` (or any `LinearModel` with no noise) in a
+    `LinearGaussianModel` with negligible (epsilon * I) observation noise so the
+    Kalman filter can consume it uniformly. Models that are already linear-Gaussian
+    are returned unchanged.
+    """
+
+    if isinstance(model, LinearGaussianModel):
+        return model
+    if isinstance(model, LinearModel):
+        return LinearGaussianModel(
+            model=model,
+            noise_cov=PSDMatrix(eps * torch.eye(dim))
+        )
+    raise ValueError(
+        f"Kalman filter requires a LinearModel (or subclass); got {type(model)}."
+    )
 
 """
 TODO: Need to add particle filter and various Gaussian quadratures
@@ -21,12 +46,15 @@ class FilterPredict(ABC):
     """
     Defines the structure of the predict function in a state estimation filter.
 
-    Could initialize with the model, but not sure if that adds any benefit.
+    All concrete predict implementations push a `FilteringDistribution` through a
+    `Model`, optionally returning the cross-covariance between the input and output
+    distributions for use in the corresponding update step.
     """
 
     @abstractmethod
     def __call__(
         self,
+        model: Model,
         dist: FilteringDistribution,
         u: Tensor = None,
         crossCov: bool = False
@@ -190,10 +218,11 @@ class Filter(ABC):
             log_prob = 0.0
         
         if y0:
+            t = 0
             y_dist, U = self.observations_filter(
-                self.model,
-                self.dist, 
-                data.u[t] if data.u is not None else None,
+                model=self.model.observations,
+                dist=self.dist,
+                u=data.u[t] if data.u is not None else None,
                 crossCov=True
             )
             
@@ -234,8 +263,12 @@ class Filter(ABC):
         self,
         data: Data,
         init_dist: FilteringDistribution,
-        y0: bool = False
+        y0: bool = False,
+        params: Tensor | None = None
     ) -> Tensor:
+        
+        if params is not None:
+            self.model.update(params)
         
         _, logprob = self.filter(
             data = data, 
@@ -256,10 +289,11 @@ class KalmanFilter(Filter):
     ) -> None:
         
         if not isinstance(model.dynamics, LinearGaussianModel):
-            raise ValueError(f"Kalman filter requires a linear Gaussian model, but dynamics are type {type(model.dynamics)}")
-        if not isinstance(model.observations, LinearGaussianModel):
-            raise ValueError(f"Kalman filter requires a linear Gaussian model, but observations are type {type(model.observations)}")
-        
+            raise ValueError(f"Kalman filter requires a linear Gaussian dynamics model, but got type {type(model.dynamics)}")
+        # IdentityModel / LinearModel observations are accepted and wrapped with a
+        # near-zero noise covariance so the same Kalman update math applies.
+        model.observations = _ensure_linear_gaussian(model.observations, model.ydim)
+
         super().__init__(
             model = model,
             dynamics_filter = KalmanPredict(),
@@ -364,10 +398,17 @@ class EnsembleKalmanFilter(Filter):
         data: Data,
         init_dist: FilteringDistribution,
         y0: bool = False,
-        obs_freq: int | Tensor | None = None,
-        return_history: bool = False
+        return_history: bool = False,
+        compute_log_prob: bool = False
     ) -> FilteringDistribution | List[FilteringDistribution]:
     
+        init_dist = copy.copy(init_dist)
         init_dist.sample_particles(self.ensemble_size)
 
-        return super().filter(data, init_dist, y0, obs_freq, return_history)
+        return super().filter(
+            data=data,
+            init_dist=init_dist,
+            y0=y0,
+            return_history=return_history,
+            compute_log_prob=compute_log_prob,
+        )

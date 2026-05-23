@@ -34,7 +34,12 @@ class FilteringDistribution:
             self.dim = particles.shape[-1]
         
         self.mean = mean
-        self._cov = PSDMatrix(cov) if type(cov) is not PSDMatrix else cov
+        if cov is None:
+            self._cov = None
+        elif isinstance(cov, PSDMatrix):
+            self._cov = cov
+        else:
+            self._cov = PSDMatrix(cov)
         self._particles = particles
         self.quad_points = quad_points
         self.size = 0 if particles is None else particles.shape[0]
@@ -45,32 +50,42 @@ class FilteringDistribution:
     @property
     def cov(
         self
-    ) -> Tensor:
-        return self._cov.val
+    ) -> Tensor | None:
+        return None if self._cov is None else self._cov.val
     
     @cov.setter
     def cov(
         self,
-        value: Tensor
+        value: Tensor | None
     ) -> None:
-            
-        self._cov.val = value
 
+        if value is None:
+            self._cov = None
+        elif self._cov is None:
+            self._cov = value if isinstance(value, PSDMatrix) else PSDMatrix(value)
+        elif isinstance(value, PSDMatrix):
+            self._cov = value
+        else:
+            self._cov.val = value
+    
     @property
     def sqrt_cov(
         self
-    ) -> Tensor:
+    ) -> Tensor | None:
             
-        return self._cov.sqrt
+        return None if self._cov is None else self._cov.sqrt
     
     @sqrt_cov.setter
     def sqrt_cov(
         self,
         value: Tensor
     ) -> None:
-                
-        self._cov.sqrt = value
-
+        
+        if self._cov is None:
+            self._cov = PSDMatrix(default_sqrt=value)
+        else:
+            self._cov.sqrt = value
+    
     @property
     def inv_cov(
         self
@@ -90,7 +105,8 @@ class FilteringDistribution:
         self
     ) -> None:
         
-        self._cov.update()
+        if self._cov is not None:
+            self._cov.update()
 
     @property
     def particles(
