@@ -2,32 +2,58 @@
 
 from bside.dataset import DataTrajectories, Data
 from bside.dmd import DMD, DMDc
-from bside.dynamics import Model, AdditiveModel, LinearModel, NonlinearModel, IdentityModel, NonlinearAdditiveModel, LinearGaussianModel
-from bside.filtering import *
-from bside.models import FeedforwardNetwork, ResidualNetwork, PSDMatrix, Matrix, SquaredMatrix, ExponentialMatrix, DiagonalMatrix
+from bside.dynamics import (
+    AdditiveModel,
+    IdentityModel,
+    LinearGaussianModel,
+    LinearModel,
+    Model,
+    NonlinearAdditiveModel,
+    NonlinearModel,
+)
+from bside.filtering import *  # noqa: F401, F403
+from bside.models import (
+    DiagonalMatrix,
+    ExponentialMatrix,
+    FeedforwardNetwork,
+    Matrix,
+    PSDMatrix,
+    ResidualNetwork,
+    SquaredMatrix,
+)
 from bside.ssm import SSM
 from bside.subspace_encoder import SubspaceEncoder
 
 
 __all__ = (
     "AdditiveModel",
+    "CubatureKalmanFilter",
     "Data",
     "DataTrajectories",
     "DMD",
     "DMDc",
     "DiagonalMatrix",
+    "EnsembleKalmanFilter",
     "ExponentialMatrix",
     "FeedforwardNetwork",
+    "FilteringDistribution",
+    "GaussHermiteFilter",
     "IdentityModel",
+    "KalmanFilter",
     "LinearGaussianModel",
     "LinearModel",
     "Matrix",
     "Model",
     "NonlinearAdditiveModel",
     "NonlinearModel",
+    "ParticleFilter",
     "PSDMatrix",
     "ResidualNetwork",
     "SSM",
+    "SquareRootKalmanFilter",
     "SquaredMatrix",
-    "SubspaceEncoder"
+    "SubspaceEncoder",
+    "UnscentedKalmanFilter",
+    "collate_filtering_distributions",
+    "plot_filtering_distributions",
 )
