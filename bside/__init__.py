@@ -23,6 +23,7 @@ from bside.models import (
 )
 from bside.ssm import SSM
 from bside.subspace_encoder import SubspaceEncoder
+from bside.sysid import EM, MultiShootingLoss, Posterior
 
 
 __all__ = (
@@ -33,6 +34,7 @@ __all__ = (
     "DMD",
     "DMDc",
     "DiagonalMatrix",
+    "EM",
     "EnsembleKalmanFilter",
     "ExponentialMatrix",
     "FeedforwardNetwork",
@@ -44,10 +46,12 @@ __all__ = (
     "LinearModel",
     "Matrix",
     "Model",
+    "MultiShootingLoss",
     "NonlinearAdditiveModel",
     "NonlinearModel",
     "ParticleFilter",
     "ParticleSmoother",
+    "Posterior",
     "PSDMatrix",
     "RTSSmoother",
     "ResidualNetwork",
