@@ -157,8 +157,12 @@ class FilteringDistribution:
         """
         Gaussian log probability at ``x``.  Uses ``solve_triangular`` on the
         Cholesky factor for the Mahalanobis term so we never form the inverse.
+
+        Returns a 0-D tensor when ``x`` is a single point, or a 1-D tensor of
+        per-point log-densities when ``x`` is a (batch, dim) tensor.
         """
 
+        single = x.ndim == 1
         v = torch.atleast_2d(x - self.mean)
         log_prob = torch.sum(solve_triangular(self.sqrt_cov, v.T, upper=False)**2, axis=-2) # Mahalanobis distance
 
@@ -166,7 +170,8 @@ class FilteringDistribution:
             log_det = 2 * torch.sum(torch.log(torch.diagonal(self.sqrt_cov, dim1=-2, dim2=-1)), axis=-1)
             log_prob = log_prob + log_det + self.dim * log(2*pi)
 
-        return -0.5 * log_prob
+        result = -0.5 * log_prob
+        return result.squeeze(0) if single else result
     
     def sample(
         self,
