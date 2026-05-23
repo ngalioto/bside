@@ -5,6 +5,7 @@ repo_url: https://github.com/ngalioto/bside
 nav:
   - Home: index.md
   - Algorithms: algorithms.md
+  - Design notes: design-notes.md
   - About: about.md
 
 theme:

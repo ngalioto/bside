@@ -9,8 +9,9 @@ from numpy import ndarray
 class Data:
 
     """
-    TODO: Edit to allow y and u at different timesteps
-    NOTE: always assume we have u at the same time point as y (for the output function)
+    NOTE: ``y`` and ``u`` are assumed aligned at the same time indices (required
+    by ``Filter.filter`` and ``SSM.measure``).  Asynchronous control/observation
+    timing is deferred — see ``docs/design-notes.md`` (Data layer section).
 
     A class for storing data in the form of a PyTorch tensor.
     

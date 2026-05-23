@@ -100,6 +100,9 @@ samples, log_probs = dram(N=10_000)
 See [`examples/`](https://github.com/ngalioto/bside/tree/main/examples) for full
 runnable scripts (Lorenz '63 UKF / PF, linear smoother, EM, Bayesian pendulum).
 
+Developers extending the package should read [`docs/design-notes.md`](design-notes.md)
+for architecture rationale, efficiency invariants, and deferred items.
+
 ## License
 
 MIT License (c) 2024
