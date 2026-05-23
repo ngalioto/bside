@@ -35,6 +35,12 @@ from .filters import (
     UnscentedKalmanPredict,
 )
 
+from .smoothers import (
+    ParticleSmoother,
+    RTSSmoother,
+    UnscentedRTSSmoother,
+)
+
 from . import functional
 
 from .plotting import collate_filtering_distributions, plot_filtering_distributions
@@ -56,10 +62,13 @@ __all__ = [
     'KalmanPredict',
     'KalmanUpdate',
     'ParticleFilter',
+    'ParticleSmoother',
+    'RTSSmoother',
     'SquareRootKalmanFilter',
     'SquareRootKalmanPredict',
     'UnscentedKalmanFilter',
     'UnscentedKalmanPredict',
+    'UnscentedRTSSmoother',
     'collate_filtering_distributions',
     'functional',
     'plot_filtering_distributions',
