@@ -136,3 +136,63 @@ def test_linear_gaussian_model_parameters_are_discoverable():
     params = list(lg.parameters())
     assert len(params) == 1  # only A_mat has learnable params
     assert params[0] is A_mat.params
+
+
+# ---------------------------------------------------------------------------
+# SSM simulation: {predict, measure} x {process noise off, on}
+# ---------------------------------------------------------------------------
+
+def _noisy_ssm(q=0.04, r=0.01):
+    A = 0.9 * torch.eye(2)
+    dynamics = bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(A)), noise_cov=q * torch.eye(2))
+    observations = bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.tensor([[1.0, 0.0]]))),
+                                             noise_cov=torch.tensor([[r]]))
+    return bside.SSM(xdim=2, ydim=1, dynamics=dynamics, observations=observations), A
+
+
+def test_predict_without_process_noise_is_deterministic_and_noiseless():
+    ssm, A = _noisy_ssm()
+    x0 = torch.tensor([1.0, -1.0])
+    x, y = ssm.predict(x0, T=5, return_x=True)
+    expected = torch.stack([torch.linalg.matrix_power(A, k) @ x0 for k in range(1, 6)])
+    assert torch.allclose(x, expected)
+    assert torch.allclose(y, x[:, :1])                       # no measurement noise
+
+
+def test_predict_with_process_noise_samples_states_but_not_measurements():
+    torch.manual_seed(0)
+    ssm, A = _noisy_ssm(q=0.04)
+    x, y = ssm.predict(torch.zeros(4000, 2), T=2, return_x=True, process_noise=True)
+    increments = x[:, 1] - x[:, 0] @ A.T
+    assert torch.allclose(increments.var(0), torch.full((2,), 0.04), rtol=0.1)
+    assert torch.allclose(y, x[..., :1])                     # still no measurement noise
+
+
+def test_measure_without_process_noise_adds_only_measurement_noise():
+    torch.manual_seed(0)
+    ssm, A = _noisy_ssm(r=0.01)
+    x0 = torch.tensor([1.0, -1.0]).expand(4000, 2)
+    x, y = ssm.measure(x0, T=3, return_x=True)
+    assert torch.allclose(x, ssm.predict(x0, T=3, return_x=True)[0])   # deterministic states
+    assert abs((y - x[..., :1]).var().item() - 0.01) < 0.001
+
+
+def test_measure_with_process_noise_adds_both():
+    torch.manual_seed(0)
+    ssm, A = _noisy_ssm(q=0.04, r=0.01)
+    x, y = ssm.measure(torch.zeros(4000, 2), T=2, return_x=True, process_noise=True)
+    increments = x[:, 1] - x[:, 0] @ A.T
+    assert torch.allclose(increments.var(0), torch.full((2,), 0.04), rtol=0.1)
+    assert abs((y - x[..., :1]).var().item() - 0.01) < 0.001
+
+
+def test_batched_measure_draws_independent_noise_per_trajectory():
+    ssm, _ = _noisy_ssm()
+    y = ssm.measure(torch.zeros(3, 2), T=4)
+    assert not torch.allclose(y[0], y[1])
+
+
+def test_process_noise_requires_a_noise_model():
+    ssm = bside.SSM(xdim=2, ydim=2, dynamics=bside.LinearModel(bside.Matrix(torch.eye(2))))
+    with pytest.raises(ValueError):
+        ssm.measure(torch.zeros(2), T=3, process_noise=True)

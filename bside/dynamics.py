@@ -60,7 +60,8 @@ class Model(torch.nn.Module, ABC):
         x : Tensor,
         u : Tensor = None,
         T : int = 1,
-        keep_x0 : bool = False
+        keep_x0 : bool = False,
+        stochastic : bool = False
     ) -> Tensor:
         
         """
@@ -76,6 +77,9 @@ class Model(torch.nn.Module, ABC):
             number of timesteps to run the model forward.
         keep_x0 : bool, optional
             if True, the initial state `x` will be included in the output. Otherwise, the output will only include the predicted states.
+        stochastic : bool, optional
+            if True, each step is drawn with `sample` (deterministic map plus noise) instead of
+            evaluating the deterministic map only.
 
         Returns
         ---------
@@ -93,9 +97,10 @@ class Model(torch.nn.Module, ABC):
 
         # Collect the steps and stack them (no in-place writes), so simulations are
         # differentiable with respect to the model's parameters.
+        step = self.sample if stochastic else self
         states = [x if batch else x.unsqueeze(0)]
         for ii in range(T):
-            states.append(self(states[-1], u[ii] if u is not None else None))
+            states.append(step(states[-1], u[ii] if u is not None else None))
 
         x_out = torch.stack(states if keep_x0 else states[1:], dim=1)
         return x_out if batch else x_out.squeeze(0)

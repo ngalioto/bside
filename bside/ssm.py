@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from bside.dynamics import Model, IdentityModel
+from bside.dynamics import AdditiveModel, Model, IdentityModel
 from typing import Tuple
 
 
@@ -52,31 +52,70 @@ class SSM(torch.nn.Module):
             f"  Observations:\n    {self.observations}\n"
         )
     
+    def _rollout(
+        self,
+        x : Tensor,
+        u : Tensor | None,
+        T : int,
+        keep_y0 : bool,
+        process_noise : bool
+    ) -> Tensor:
+
+        if process_noise and not isinstance(self.dynamics, AdditiveModel):
+            raise ValueError(
+                '`process_noise=True` needs dynamics with a noise model (an AdditiveModel such as '
+                f'LinearGaussianModel), got {type(self.dynamics).__name__}.'
+            )
+        return self.dynamics.predict(x, u, T, keep_x0=keep_y0, stochastic=process_noise)
+
     def predict(
         self,
         x : Tensor,
         u : Tensor = None,
         T : int = 1,
         return_x : bool = False,
-        keep_y0 : bool = False
+        keep_y0 : bool = False,
+        process_noise : bool = False
     ) -> Tensor | Tuple[Tensor, Tensor]:
-        
-        x = self.dynamics.predict(x, u, T, keep_x0=keep_y0)
+
+        """
+        Simulate the model for `T` steps from state `x` and return the observations
+        **without measurement noise**, y = h(x).
+
+        With ``process_noise=False`` (default) the dynamics run deterministically:
+        the model's best-guess trajectory, e.g. for using a fitted model whose
+        process noise only stands for model error.  With ``process_noise=True``
+        each step samples the dynamics' noise, giving one realization of the latent
+        trajectory under that uncertainty.
+        """
+
+        x = self._rollout(x, u, T, keep_y0, process_noise)
         y = self.observations(x)
 
         return y if not return_x else (x, y)
-    
+
     def measure(
         self,
         x : Tensor,
         u : Tensor = None,
         T : int = 1,
         return_x : bool = False,
-        keep_y0 : bool = False
+        keep_y0 : bool = False,
+        process_noise : bool = False
     ) -> Tensor | Tuple[Tensor, Tensor]:
-        
-        x = self.dynamics.predict(x, u, T, keep_x0=keep_y0)
-        y = self.observations.sample(x, N=(T + keep_y0))
+
+        """
+        Simulate the model for `T` steps from state `x` and return noisy
+        measurements **with measurement noise**, y = h(x) + eta.
+
+        With ``process_noise=False`` (default) the dynamics run deterministically,
+        as when generating data from a deterministic ground truth.  With
+        ``process_noise=True`` each step also samples the dynamics' noise: a full
+        draw from the stochastic model, including model uncertainty.
+        """
+
+        x = self._rollout(x, u, T, keep_y0, process_noise)
+        y = self.observations.sample(x)  # independent noise for every point (and trajectory)
 
         return y if not return_x else (x, y)
 
