@@ -81,3 +81,15 @@ def test_noise_continuation_profiles_and_picks_best_level():
     assert prof.best == 2
     assert torch.allclose(prof.thetas[:, 0], torch.full((4,), 3.0), atol=1e-2)
     assert torch.allclose(prof.theta, torch.tensor([3.0, -1.0]), atol=1e-2)
+
+
+def test_potential_scale_reduction_flags_disagreeing_chains():
+    agree = torch.randn(1000, 4, 2)
+    apart = agree + torch.tensor([0.0, 0.0, 3.0, 3.0])[None, :, None]
+    assert (bside.potential_scale_reduction(agree) < 1.01).all()
+    assert (bside.potential_scale_reduction(apart) > 1.5).all()
+
+
+def test_laplace_covariance_of_gaussian_is_exact():
+    target = lambda x: (-0.5 * (x / torch.tensor([1.0, 0.1])) ** 2).sum(-1)  # noqa: E731
+    assert torch.allclose(bside.laplace_covariance(target, torch.zeros(2)), torch.diag(torch.tensor([1.0, 0.01])))

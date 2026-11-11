@@ -1,7 +1,7 @@
 """bside: Bayesian system identification"""
 
 from bside.dataset import DataTrajectories, Data
-from bside.dmd import DMD, DMDc
+from bside.dmd import DMD, DMDc, TDMD
 from bside.dynamics import (
     AdditiveModel,
     IdentityModel,
@@ -25,7 +25,7 @@ from bside.models import (
 from bside.ssm import SSM
 from bside.subspace_encoder import SubspaceEncoder
 from bside.sysid import (EM, HMC, MultiShootingLoss, Posterior, autocorrelation, effective_sample_size,
-                         laplace_covariance, map_estimate, noise_continuation)
+                         laplace_covariance, map_estimate, noise_continuation, potential_scale_reduction)
 
 
 __all__ = (
@@ -36,6 +36,7 @@ __all__ = (
     "DataTrajectories",
     "DMD",
     "DMDc",
+    "TDMD",
     "DiagonalMatrix",
     "EM",
     "HMC",
@@ -73,5 +74,6 @@ __all__ = (
     "laplace_covariance",
     "map_estimate",
     "noise_continuation",
+    "potential_scale_reduction",
     "plot_filtering_distributions",
 )

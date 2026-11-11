@@ -329,3 +329,23 @@ def effective_sample_size(
             tau += 2 * pair.item()
         ess.append(n / max(tau, 1.0 / n))
     return torch.tensor(ess)
+
+
+def potential_scale_reduction(
+    chains: Tensor,
+) -> Tensor:
+    """
+    Split-R-hat (Gelman et al., 2013) for chains of shape ``(n, C, p)``.
+
+    Each chain is split in half, then the between-chain and within-chain
+    variances are compared.  Values near 1 (say below 1.01-1.05) indicate that
+    the chains agree; values well above 1 indicate non-convergence, or chains
+    sitting in different modes of a multimodal posterior.
+    """
+
+    n = chains.shape[0] // 2
+    halves = torch.cat([chains[:n], chains[n:2 * n]], dim=1)          # (n, 2C, p)
+    within = halves.var(0).mean(0)
+    between = n * halves.mean(0).var(0)
+    var_plus = (n - 1) / n * within + between / n
+    return (var_plus / within).sqrt()

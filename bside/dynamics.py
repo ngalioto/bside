@@ -91,15 +91,13 @@ class Model(torch.nn.Module, ABC):
             elif u.shape[0] < T:
                 raise ValueError(f'{T} timesteps specified, but only {u.shape[0]} inputs provided')
 
-        x_out = torch.zeros(x.shape[0] if batch else 1, T+1, self.out_dim)
-        x_out[:, 0] = x.clone() if batch else x.unsqueeze(0)
-
+        # Collect the steps and stack them (no in-place writes), so simulations are
+        # differentiable with respect to the model's parameters.
+        states = [x if batch else x.unsqueeze(0)]
         for ii in range(T):
-            x_out[:, ii+1] = self(x_out[:, ii], u[ii] if u is not None else None)
+            states.append(self(states[-1], u[ii] if u is not None else None))
 
-        if not keep_x0:
-            x_out = x_out[:, 1:]
-
+        x_out = torch.stack(states if keep_x0 else states[1:], dim=1)
         return x_out if batch else x_out.squeeze(0)
     
 

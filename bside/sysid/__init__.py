@@ -16,7 +16,7 @@ from .posterior import Posterior
 from .multi_shooting import MultiShootingLoss
 from .em import EM
 from .inference import (HMC, NoiseProfile, autocorrelation, effective_sample_size, laplace_covariance,
-                        map_estimate, noise_continuation)
+                        map_estimate, noise_continuation, potential_scale_reduction)
 
 __all__ = [
     "EM",
@@ -29,4 +29,5 @@ __all__ = [
     "laplace_covariance",
     "map_estimate",
     "noise_continuation",
+    "potential_scale_reduction",
 ]

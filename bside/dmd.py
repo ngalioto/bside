@@ -164,6 +164,37 @@ class DMD:
 
         return self.loss(*self.form_snapshot_matrices(data))
 
+class TDMD(DMD):
+
+    """
+    Total-least-squares DMD (Hemati et al., 2017).  Plain DMD regresses the
+    next snapshot on the current one and so attributes all noise to the
+    outputs, which biases the eigenvalues toward zero (damping).  TDMD treats
+    both snapshot matrices as noisy: with Z = [Y^T, Y'^T] (one row per
+    snapshot pair) and V the right singular vectors of Z partitioned as
+    [[V11, V12], [V21, V22]] (the last m columns belonging to the m smallest
+    singular values), the total-least-squares solution of Y^T A^T = Y'^T is
+    A^T = -V12 V22^{-1}.
+    """
+
+    def estimate_model(
+        self,
+        input : Tensor,
+        output : Tensor,
+        rank : int,
+        rom : bool
+    ) -> None:
+
+        if rom:
+            raise NotImplementedError('TDMD does not provide a reduced-order model.')
+
+        m = input.shape[0]
+        _, _, Vh = torch.linalg.svd(torch.cat([input.T, output.T], dim=1), full_matrices=True)
+        V = Vh.mT
+        V12, V22 = V[:m, m:], V[m:, m:]
+        self.A = (-V12 @ torch.linalg.inv(V22)).mT
+
+
 class DMDc(DMD):
 
     """

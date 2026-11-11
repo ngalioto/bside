@@ -64,3 +64,22 @@ def test_dmdc_rom_branch_runs():
     dmdc.estimate_model(input=inp, output=x[:, 1:], rank=3, rom=True)
     assert dmdc.A_rom.shape == (3, 3)
     assert dmdc.B_rom.shape == (3, 1)
+
+
+def test_tdmd_recovers_operator_and_is_less_damped_than_dmd_under_noise():
+    torch.manual_seed(0)
+    A = torch.linalg.matrix_exp(torch.tensor([[0.0, 1.0], [-9.81, 0.0]]) * 0.1)
+    x = bside.LinearModel(bside.Matrix(A)).predict(torch.tensor([1.0, 0.0]), T=200)
+    assert torch.allclose(_fit_A(bside.TDMD(), x), A, atol=1e-4)
+
+    # Measurement noise biases DMD's eigenvalues toward zero; TDMD corrects for it.
+    y = x + 0.2 * torch.randn_like(x)
+    true_mod = torch.linalg.eigvals(A).abs().max()
+    dmd_mod = torch.linalg.eigvals(_fit_A(bside.DMD(), y)).abs().max()
+    tdmd_mod = torch.linalg.eigvals(_fit_A(bside.TDMD(), y)).abs().max()
+    assert abs(tdmd_mod - true_mod) < abs(dmd_mod - true_mod)
+
+
+def _fit_A(model, y):
+    model.fit(bside.Data(y=y))
+    return model.A

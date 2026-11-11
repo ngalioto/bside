@@ -63,15 +63,20 @@ plt.show()
 # The priors are flat on $A$ and half-normal on the two variances.
 
 # %%
-diag = torch.eye(2, dtype=torch.bool)
-A = bside.Matrix(torch.eye(2), mask=torch.ones(2, 2, dtype=torch.bool), indices=torch.arange(4))
-Sigma = bside.CholeskyMatrix(0.01 * torch.eye(2), mask=diag, indices=torch.tensor([4, 4]))
-Gamma = bside.CholeskyMatrix(0.01 * torch.eye(2), mask=diag, indices=torch.tensor([5, 5]))
-model = bside.SSM(
-    xdim=xdim, ydim=ydim,
-    dynamics=bside.LinearGaussianModel(model=bside.LinearModel(A), noise_cov=Sigma),
-    observations=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(2))), noise_cov=Gamma),
-)
+def linear_model():
+    """Learnable linear model: theta = (A11, A12, A21, A22, log sd proc, log sd meas)."""
+    diag = torch.eye(2, dtype=torch.bool)
+    A = bside.Matrix(torch.eye(2), mask=torch.ones(2, 2, dtype=torch.bool), indices=torch.arange(4))
+    Sigma = bside.CholeskyMatrix(0.01 * torch.eye(2), mask=diag, indices=torch.tensor([4, 4]))
+    Gamma = bside.CholeskyMatrix(0.01 * torch.eye(2), mask=diag, indices=torch.tensor([5, 5]))
+    return bside.SSM(
+        xdim=xdim, ydim=ydim,
+        dynamics=bside.LinearGaussianModel(model=bside.LinearModel(A), noise_cov=Sigma),
+        observations=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(2))), noise_cov=Gamma),
+    )
+
+
+model = linear_model()
 
 
 def log_prior(theta, tau=1.0):
@@ -98,7 +103,8 @@ em_model = bside.SSM(
     dynamics=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(2))), noise_cov=0.1 * torch.eye(2)),
     observations=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(2))), noise_cov=0.1 * torch.eye(2)),
 )
-log_marg = bside.EM(ssm=em_model, init_dist=init_dist).fit(data, n_iter=500, tol=1e-5)
+em = bside.EM(ssm=em_model, init_dist=init_dist)
+log_marg = em.fit(data, n_iter=500, tol=1e-5)
 print(f'EM: {len(log_marg)} iterations, log p(y) {log_marg[0]:.1f} -> {log_marg[-1]:.1f}')
 print('eigenvalues of A, true:', torch.linalg.eigvals(A_true))
 print('eigenvalues of A, EM:  ', torch.linalg.eigvals(em_model.dynamics.mat_x))
@@ -188,6 +194,9 @@ for i in range(6):
     axes[0, i].plot(dram_samples[:, i], color='C0', lw=0.4)
     axes[0, i].set_title(param_names[i], fontsize=9)
     axes[1, i].plot(hmc_chains[:, 0, i], color='C2', lw=0.4)
+    if torch.isfinite(theta_true[i]):
+        for row in (0, 1):
+            axes[row, i].axhline(theta_true[i], color='k', lw=1)
     axes[2, i].plot(acf_dram[:, i], color='C0', label='DRAM')
     axes[2, i].plot(acf_hmc[:, i], color='C2', label='HMC')
     axes[2, i].axhline(0, color='gray', lw=0.5)
@@ -223,29 +232,161 @@ fig.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## Posterior predictive
+# ## Comparison with DMD, TDMD and EM
 #
-# Push 500 posterior samples of $A$ forward past the end of the data (as in the
-# paper's Fig. 6). The band shows where the posterior expects the pendulum to
-# be, and it widens as the forecast moves away from the data.
+# The paper compares the Bayesian approach with dynamic mode decomposition.
+# **DMD** regresses each measurement on the previous one by least squares,
+# which treats the measurement noise as process noise. **TDMD** uses total
+# least squares, which allows noise in both. **EM** is the maximum-likelihood
+# point estimate from above. All of them, and 500 posterior samples of $A$, are
+# simulated forward from the same initial condition, past the end of the data
+# (as in the paper's Fig. 6).
 
 # %%
 horizon = 2 * n
+truth = bside.LinearModel(bside.Matrix(A_true)).predict(x0, T=horizon)
+
 draws = hmc_samples[torch.randint(len(hmc_samples), (500,))]
 model.update(draws)  # a batch of 500 models
 paths = model.dynamics.model.predict(x0.expand(500, 2), T=horizon)
-truth = bside.LinearModel(bside.Matrix(A_true)).predict(x0, T=horizon)
 
+dmd, tdmd = bside.DMD(), bside.TDMD()
+dmd.fit(data)
+tdmd.fit(data)
+point = {
+    'DMD': (dmd.A, bside.LinearModel(bside.Matrix(dmd.A)).predict(x0, T=horizon)),
+    'TDMD': (tdmd.A, bside.LinearModel(bside.Matrix(tdmd.A)).predict(x0, T=horizon)),
+    'EM': (em_model.dynamics.mat_x,
+           em_model.dynamics.model.predict(em.init_dist.mean, T=horizon) @ em_model.observations.mat_x.mT),
+    'Bayes (posterior mean)': (draws[:, :4].mean(0).reshape(2, 2), paths.mean(0)),
+}
+
+
+def rmse(pred, window):
+    return (pred[window] - truth[window]).pow(2).mean().sqrt().item()
+
+
+fit_window, forecast_window = slice(0, n), slice(n, horizon)
+print(f'{"":>24} {"|eig| (true " + format(torch.linalg.eigvals(A_true).abs()[0].item(), ".4f") + ")":>20} '
+      f'{"RMSE 0-4 s":>11} {"RMSE 4-8 s":>11}')
+for name, (A_est, pred) in point.items():
+    modulus = torch.linalg.eigvals(A_est).abs().max().item()
+    print(f'{name:>24} {modulus:20.4f} {rmse(pred, fit_window):11.4f} {rmse(pred, forecast_window):11.4f}')
+
+# %%
 t_long = torch.arange(1, horizon + 1) * dt
-fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+styles = {'DMD': 'C3', 'TDMD': 'C4', 'EM': 'C5'}
+fig, axes = plt.subplots(1, 2, figsize=(12, 3.5))
 for i, (ax, name) in enumerate(zip(axes, ['angle', 'angular velocity'])):
-    lo, mid, hi = torch.quantile(paths[..., i], torch.tensor([0.025, 0.5, 0.975]), dim=0)
-    ax.fill_between(t_long, lo, hi, color='C1', alpha=0.3, label='95% posterior predictive')
-    ax.plot(t_long, mid, 'C1', label='median')
+    lo, hi = torch.quantile(paths[..., i], torch.tensor([0.025, 0.975]), dim=0)
+    ax.fill_between(t_long, lo, hi, color='C1', alpha=0.25, label='Bayes 95% predictive')
+    ax.plot(t_long, paths[..., i].mean(0), 'C1', lw=1.5, label='Bayes mean')
+    for method, color in styles.items():
+        ax.plot(t_long, point[method][1][:, i], color=color, lw=1, label=method)
     ax.plot(t_long, truth[:, i], 'k', lw=1, label='truth')
     ax.plot(t, y[:, i], '.', color='C0', label='data')
     ax.axvline(n * dt, color='gray', ls='--', lw=1)
     ax.set_title(name)
     ax.set_xlabel('time')
-axes[0].legend(fontsize=8)
+axes[0].legend(fontsize=7, ncol=2)
+fig.tight_layout()
 plt.show()
+
+# %% [markdown]
+# DMD treats all noise as process noise, so its eigenvalues shrink toward zero
+# and its forecast decays to rest; TDMD damps less but drifts out of phase, as
+# in the paper. Both the Bayesian posterior and EM recover an essentially
+# undamped oscillator. With 40 points, EM's point estimate forecasts best here.
+# The posterior mean averages over all plausible matrices, including slightly
+# damped ones, so its oscillation shrinks with time. What the posterior adds is
+# the band: it widens past the data and contains the truth throughout.
+
+# %% [markdown]
+# ## The noise trade-off, and model error
+#
+# Process noise and measurement noise compete to explain the same residuals:
+# either the model is imperfect and the data are accurate, or the model is
+# right and the data are noisy. The paper (Sec. 6.3) notes their variances are
+# negatively correlated, and that a linear model of a *nonlinear* pendulum can
+# give a bimodal noise posterior (Sec. 6.4, Fig. 12a).
+#
+# To check both, compare the data set above with the paper's model-error case.
+# Its data come from the nonlinear pendulum with $x_0 = (2.5, 0)$: 24 points
+# over 4 s, noise standard deviation 0.1, fit with the same linear model.
+# Bimodality is easy to miss with one chain, so each case runs four HMC chains
+# in parallel. For the model-error case, the chains start from the optima of
+# four MAP fits that begin at very different noise levels.
+
+# %%
+def nonlinear_pendulum(x0, steps, step_dt, substeps=20):
+    """RK4 integration of the nonlinear pendulum, sampled every step_dt."""
+    def vector_field(x):
+        return torch.stack([x[..., 1], -g * torch.sin(x[..., 0])], dim=-1)
+    out, x, h = [], x0, step_dt / substeps
+    for _ in range(steps):
+        for _ in range(substeps):
+            k1 = vector_field(x)
+            k2 = vector_field(x + h / 2 * k1)
+            k3 = vector_field(x + h / 2 * k2)
+            k4 = vector_field(x + h * k3)
+            x = x + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        out.append(x)
+    return torch.stack(out)
+
+
+x0_nl = torch.tensor([2.5, 0.0])
+x_nl = nonlinear_pendulum(x0_nl, 24, 4.0 / 24)
+y_nl = x_nl + 0.1 * torch.randn_like(x_nl)
+posterior_nl = bside.Posterior(bside.ParallelKalmanFilter(linear_model()), bside.Data(y=y_nl),
+                               bside.FilteringDistribution(mean=x0_nl, cov=0.01 * torch.eye(2)), prior=log_prior)
+
+noise_starts = torch.log(torch.tensor([[0.01, 0.3], [0.3, 0.01], [0.1, 0.1], [0.03, 0.03]]))
+starts_nl = torch.cat([torch.eye(2).flatten() + 0.1 * torch.randn(4, 4), noise_starts], dim=-1)
+map_nl, trace_nl = bside.map_estimate(posterior_nl, starts_nl, n_steps=600, lr=0.02)
+print('Model error: MAP from four noise starts')
+for k, (theta, lp) in enumerate(zip(map_nl, trace_nl[-1])):
+    print(f'  start {k + 1}: process sd {theta[4].exp():.3f}, measurement sd {theta[5].exp():.3f}, '
+          f'log posterior {lp:.1f}')
+
+hmc_nl = bside.HMC(posterior_nl, n_leapfrog=10)
+chains_nl, _ = hmc_nl(map_nl, n_samples=800, n_warmup=400)
+
+for name, chains in [('linear truth (above)', hmc_chains), ('model error', chains_nl)]:
+    flat = chains.reshape(-1, 6)
+    variances = torch.exp(2 * flat[:, 4:])
+    print()
+    print(f'{name}: R-hat {bside.potential_scale_reduction(chains).numpy().round(3)}')
+    print(f'  corr(process var, measurement var) = {torch.corrcoef(variances.T)[0, 1]:.2f}, '
+          f'corr(log sds) = {torch.corrcoef(flat[:, 4:].T)[0, 1]:.2f}')
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for ax, (title, chains, optima) in zip(axes, [('linear truth', hmc_chains, None),
+                                              ('model error (paper Sec. 6.4)', chains_nl, map_nl)]):
+    for c in range(chains.shape[1]):
+        v = torch.exp(2 * chains[:, c, 4:])
+        ax.plot(v[:, 0], v[:, 1], '.', ms=1.5, alpha=0.4, color=f'C{c}')
+        ax.plot([], [], 'o', ms=4, color=f'C{c}', label=f'chain {c + 1}')   # legend entry
+    if optima is not None:
+        v = torch.exp(2 * optima[:, 4:])
+        ax.plot(v[:, 0], v[:, 1], 'k*', ms=10, label='MAP optima')
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('process-noise variance')
+    ax.set_ylabel('measurement-noise variance')
+    ax.set_title(title, fontsize=10)
+    ax.legend(fontsize=7)
+fig.tight_layout()
+plt.show()
+
+# %% [markdown]
+# In both cases the process- and measurement-noise variances are only weakly
+# negatively correlated, and the four chains agree (R-hat near 1). With the
+# linear truth the process noise sits far below the measurement noise, so the
+# two barely compete. With model error, MAP fits started at different noise
+# levels stop at different optima, the paper's two explanations of the data.
+# The chains, however, all settle around the high-process-noise optimum: the
+# low-process-noise optima have log posteriors more than 10 lower and carry
+# negligible posterior mass for this data set. Whether a second mode carries
+# visible mass depends on the data realization and noise level; parallel
+# chains started from dispersed optima are how to find out.

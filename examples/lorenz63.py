@@ -262,14 +262,16 @@ for i, name in enumerate(names):
           ('' if truth[i] is None else f'   (true {truth[i]:.3f})'))
 
 # %% [markdown]
-# Diagnostics: trace plots (no trends or long flat stretches) and
-# autocorrelations (quick decay) indicate good mixing.
+# Diagnostics: trace plots (no trends or long flat stretches; true values in
+# black) and autocorrelations (quick decay) indicate good mixing.
 
 # %%
 acf = bside.autocorrelation(samples, max_lag=100)
 fig, axes = plt.subplots(2, 7, figsize=(17, 4.5))
 for i in range(7):
     axes[0, i].plot(samples[:, i], color='C0', lw=0.4)
+    if truth[i] is not None:
+        axes[0, i].axhline(truth[i], color='k', lw=1)
     axes[0, i].set_title(names[i], fontsize=9)
     axes[1, i].plot(acf[:, i], color='C0')
     axes[1, i].axhline(0, color='gray', lw=0.5)
@@ -334,3 +336,76 @@ for k, (traj, color, title) in enumerate([(true_long, 'k', 'truth over 200 s, wi
     ax.set_title(title, fontsize=10)
 fig.tight_layout()
 plt.show()
+
+# %% [markdown]
+# ## Comparison with methods that ignore process noise
+#
+# Two standard alternatives fit the same data without a process-noise model:
+#
+# - **Derivative regression** (SINDy with the true library of Lorenz terms).
+#   Estimate dx/dt by central differences of the noisy data, then solve for
+#   $\theta$ by least squares. With measurement noise of 2 and spacing 0.1 s,
+#   the derivative estimates are very noisy, and using noisy states as
+#   regressors biases the estimates.
+# - **Deterministic fit** (output error, single shooting). Simulate the Lorenz
+#   ODE from $x_0$ and minimize the squared error to the data over $\theta$,
+#   from the same four starting points. Without process noise the simulation
+#   must match all 10 s at once, which is the rough, chaotic landscape of the
+#   paper's Fig. 1.
+
+# %%
+# Derivative regression with the true library
+dy = (y[2:] - y[:-2]) / (2 * DT)
+x1, x2, x3 = y[1:-1].unbind(-1)
+theta_reg = torch.stack([
+    torch.linalg.lstsq((x2 - x1)[:, None], dy[:, 0:1]).solution.squeeze(),
+    torch.linalg.lstsq(x1[:, None], (dy[:, 1] + x1 * x3 + x2)[:, None]).solution.squeeze(),
+    torch.linalg.lstsq(x3[:, None], (x1 * x2 - dy[:, 2])[:, None]).solution.squeeze(),
+])
+
+# Deterministic fit from the same four starts (batched)
+shooting_model = bside.NonlinearModel(Lorenz63(theta_dyn_true.clone()), in_dim=3, out_dim=3)
+
+
+def neg_squared_error(theta):
+    shooting_model.update(theta)
+    simulated = shooting_model.predict(x0.expand(*theta.shape[:-1], 3), T=n)
+    return -0.5 * ((simulated - y) ** 2).sum((-1, -2)) / 4.0   # Gaussian log-likelihood, sd 2
+
+
+theta_det, det_trace = bside.map_estimate(neg_squared_error, starts, n_steps=300, lr=0.05)
+best_det = theta_det[det_trace[-1].argmax()]
+
+estimates = {
+    'Bayes (posterior mean)': theta_mean,
+    'derivative regression': theta_reg,
+    'deterministic fit (best start)': best_det,
+}
+print(f'{"":>31} {"theta_1":>8} {"theta_2":>8} {"theta_3":>8}')
+print(f'{"truth":>31} {10.0:8.3f} {28.0:8.3f} {8 / 3:8.3f}')
+for name, theta in estimates.items():
+    print(f'{name:>31} ' + ' '.join(f'{v:8.3f}' for v in theta.tolist()))
+print('deterministic fit, all four starts:\n', theta_det.numpy().round(2))
+
+# %%
+fig, axes = plt.subplots(1, 4, figsize=(15, 3.4), sharex=True, sharey=True)
+panels = [('truth', true_long, 'k')] + [
+    (name, bside.NonlinearModel(Lorenz63(theta), in_dim=3, out_dim=3).predict(x0, T=T_long), color)
+    for (name, theta), color in zip(estimates.items(), ['C1', 'C3', 'C4'])
+]
+with torch.no_grad():
+    for ax, (name, traj, color) in zip(axes, panels):
+        ax.plot(traj[:, 0], traj[:, 2], color=color, lw=0.3, alpha=0.6)
+        ax.set_title(name, fontsize=10)
+        ax.set_xlabel('x')
+axes[0].set_ylabel('z')
+fig.tight_layout()
+plt.show()
+
+# %% [markdown]
+# Only the filter-based posterior recovers all three parameters. Derivative
+# regression keeps the attractor's shape but underestimates theta_1 (about 6
+# instead of 10), the bias from noisy derivatives and noisy regressors. The
+# deterministic fit stops at a different local optimum from each start, all far
+# from the truth; its best start collapses to a fixed point. This is the rough,
+# multi-modal landscape that process noise smooths out.
