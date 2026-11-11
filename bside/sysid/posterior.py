@@ -91,4 +91,12 @@ class Posterior:
         self,
         params: Tensor,
     ) -> Tensor:
-        return self.log_likelihood(params) + self.log_prior(params)
+        # Samplers may pass a single point as a (1, p) row; the model expects (p,)
+        # and the sampler expects the log-density back with the same leading shape.
+        lead = params.shape[:-1]
+        theta = params.reshape(-1)
+        log_prior = self.log_prior(theta)
+        if not torch.isfinite(log_prior):
+            # Outside the prior's support: skip the filter (the model may be invalid there).
+            return log_prior.reshape(lead)
+        return (self.log_likelihood(theta) + log_prior).reshape(lead)

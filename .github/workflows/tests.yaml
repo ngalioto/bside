@@ -1,9 +1,9 @@
 name: Tests
 
+# Runs only on demand and as the gate before a PyPI release (never on push),
+# so routine commits do not trigger notification emails.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
   workflow_call:
 
 permissions:

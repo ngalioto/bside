@@ -7,14 +7,29 @@ from bside.filtering import FilteringDistribution
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
+def _moments(
+    dist: FilteringDistribution
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mean and covariance of a Gaussian, weighted-particle or ensemble distribution."""
+
+    if dist.mean is not None and dist.cov is not None:
+        return dist.mean, dist.cov
+    if dist.log_weights is not None:
+        mean = dist.weighted_mean()
+        return mean, dist.weighted_cov(mean)
+    mean = dist.particles.mean(-2)
+    res = dist.particles - mean.unsqueeze(-2)
+    return mean, res.mT @ res / (dist.size - 1)
+
+
 def collate_filtering_distributions(
     dists: Iterable[FilteringDistribution]
-) -> Tuple[torch.Tensor, torch.tensor]:
-    
-    means = torch.stack([dist.mean for dist in dists])
-    covs = torch.stack([dist.cov for dist in dists])
-    
-    return means, covs
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stack a filtering / smoothing history into ``(means, covs)`` tensors."""
+
+    means, covs = zip(*(_moments(dist) for dist in dists))
+    return torch.stack(means), torch.stack(covs)
+
 
 def plot_filtering_distributions(
     means: torch.Tensor,

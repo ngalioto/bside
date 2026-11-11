@@ -224,9 +224,9 @@ def gaussian_quadrature(
     wm, wc = dist_X.mean_weights, dist_X.cov_weights
 
     Y = _evaluate(model, dist_X.particles, u, stochastic=not additive)
-    Ymean = torch.einsum('n,...nd->...d', wm, Y)
+    Ymean = wm @ Y
     res_Y = Y - Ymean.unsqueeze(-2)
-    P = torch.einsum('...nd,n,...ne->...de', res_Y, wc, res_Y)
+    P = (res_Y.mT * wc) @ res_Y
 
     if additive:
         P = P + model.noise_cov
@@ -241,9 +241,9 @@ def gaussian_quadrature(
     )
 
     if crossCov:
-        Xmean = torch.einsum('n,...nd->...d', wm, dist_X.particles)
+        Xmean = wm @ dist_X.particles
         res_X = dist_X.particles - Xmean.unsqueeze(-2)
-        U = torch.einsum('...nd,n,...ne->...de', res_X, wc, res_Y)
+        U = (res_X.mT * wc) @ res_Y
         return dist_Y, U
 
     return dist_Y

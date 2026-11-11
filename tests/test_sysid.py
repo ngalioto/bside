@@ -152,6 +152,7 @@ def test_posterior_drives_dram_sampler(linear_gaussian_data):
         x0=theta0,
         cov=0.001 * torch.eye(4),
     )
-    samples, log_probs = dram(N=50, burn_in=10, show_progress=False)
-    assert samples.shape == (40, 4)
+    with torch.no_grad():
+        samples, log_probs = dram(50)
+    assert samples.shape == (50, 4)
     assert torch.isfinite(log_probs).all()
