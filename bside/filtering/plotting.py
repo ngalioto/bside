@@ -1,10 +1,14 @@
-import matplotlib.pyplot as plt
+from typing import TYPE_CHECKING, Iterable, Tuple
+
 import torch
+
 from bside.filtering import FilteringDistribution
-from typing import Iterable, Tuple
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 def collate_filtering_distributions(
-    dists = Iterable[FilteringDistribution]
+    dists: Iterable[FilteringDistribution]
 ) -> Tuple[torch.Tensor, torch.tensor]:
     
     means = torch.stack([dist.mean for dist in dists])
@@ -19,8 +23,11 @@ def plot_filtering_distributions(
     labels: Iterable[str] = None,
     colors: Iterable[str] = None,
     alpha: float = 0.5
-) -> plt.Figure:
-    
+) -> "Figure":
+
+    # matplotlib is optional (``pip install bside[plot]``); import on use only.
+    import matplotlib.pyplot as plt
+
     std_devs = torch.sqrt(covs.diagonal(dim1=-2, dim2=-1))
     t = torch.arange(means.shape[0]) if t is None else t
     

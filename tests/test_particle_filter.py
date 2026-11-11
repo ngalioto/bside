@@ -3,7 +3,6 @@
 import torch
 
 import bside
-from bside.filtering import functional as F
 
 
 def test_particle_filter_tracks_kalman_mean(linear_gaussian_ssm, linear_gaussian_data):

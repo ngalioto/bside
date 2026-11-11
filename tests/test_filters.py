@@ -115,7 +115,9 @@ def test_kalman_filter_accepts_identity_observations():
     )
     ssm = bside.SSM(xdim=2, ydim=2, dynamics=dynamics, observations=None)
     kf = bside.KalmanFilter(model=ssm)
-    assert isinstance(kf.model.observations, bside.LinearGaussianModel)
+    # The filter sees a linear-Gaussian wrapper, but the user's SSM is not modified.
+    assert isinstance(kf.observations, bside.LinearGaussianModel)
+    assert isinstance(ssm.observations, bside.IdentityModel)
 
 
 def test_nlog_marginal_likelihood_decreases_toward_true_params(linear_gaussian_ssm, linear_gaussian_data):
@@ -140,3 +142,37 @@ def test_nlog_marginal_likelihood_decreases_toward_true_params(linear_gaussian_s
     assert nll_perturbed > nll_true - 1.0  # weak but reliable
     # Restore
     linear_gaussian_ssm.dynamics.model._mat_x.val = A_orig
+
+
+@pytest.mark.parametrize("FilterCls", [
+    bside.KalmanFilter, bside.SquareRootKalmanFilter, bside.UnscentedKalmanFilter,
+])
+def test_batched_trajectories_match_individual_runs(FilterCls, linear_gaussian_ssm, linear_gaussian_data):
+    """A (B, T, ydim) batch must give the same posteriors and likelihoods as B separate runs."""
+
+    init = linear_gaussian_data["init_dist"]
+    ys = torch.stack([linear_gaussian_ssm.measure(x=linear_gaussian_data["x0"], T=30) for _ in range(3)])
+    flt = FilterCls(model=linear_gaussian_ssm)
+
+    batched, lp = flt.filter(bside.Data(y=ys), init, compute_log_prob=True)
+    for b in range(3):
+        single, lp_b = flt.filter(bside.Data(y=ys[b]), init, compute_log_prob=True)
+        assert torch.allclose(batched.mean[b], single.mean, atol=1e-4)
+        # Linear-Gaussian covariances are data-independent and may stay unbatched.
+        assert torch.allclose(batched.cov.expand(3, 2, 2)[b], single.cov, atol=1e-5)
+        assert torch.allclose(lp[b], lp_b, atol=1e-3)
+
+
+def test_square_root_likelihood_matches_kalman(linear_gaussian_ssm, linear_gaussian_data):
+    data, init = linear_gaussian_data["data"], linear_gaussian_data["init_dist"]
+    nll_kf = bside.KalmanFilter(linear_gaussian_ssm).nlog_marginal_likelihood(data, init)
+    nll_sr = bside.SquareRootKalmanFilter(linear_gaussian_ssm).nlog_marginal_likelihood(data, init)
+    assert torch.allclose(nll_kf, nll_sr, rtol=1e-4)
+
+
+def test_filter_does_not_mutate_init_dist(linear_gaussian_ssm, linear_gaussian_data):
+    init = linear_gaussian_data["init_dist"]
+    mean, cov = init.mean.clone(), init.cov.clone()
+    bside.UnscentedKalmanFilter(linear_gaussian_ssm).filter(linear_gaussian_data["data"], init)
+    assert torch.equal(init.mean, mean) and torch.equal(init.cov, cov)
+    assert init.mean_weights is None and init.particles is None

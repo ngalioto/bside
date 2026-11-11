@@ -1,10 +1,78 @@
+"""
+Stateless filtering primitives.
+
+Every Bayesian filter here is the same recursion over two units:
+
+* **predict** -- push the current state distribution through the *dynamics*
+  model ``x_k = Psi(x_{k-1}, u) + xi_k``: the deterministic map moves the
+  mean / points, the stochastic part adds the process-noise covariance.
+* **update** -- push the predicted distribution through the *observation*
+  model ``y_k = h(x_k, u) + eta_k`` to get the predictive density
+  ``p(y_k | y_{1:k-1})`` (whose value at the data is the marginal-likelihood
+  term), then condition on ``y_k``.
+
+The functions below implement those two units for each approximation family
+(closed form, square root, deterministic quadrature, ensemble, particle).
+All Gaussian primitives broadcast over leading batch dimensions, so a batch of
+independent trajectories is filtered in one pass.
+"""
+
+from math import log, pi
 from typing import Tuple
+
 import torch
 from torch import Tensor
 from torch.linalg import solve_triangular
 
-from bside.filtering import FilteringDistribution
+from bside.filtering.distributions import FilteringDistribution
 from bside.dynamics import Model, AdditiveModel, LinearGaussianModel
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _gaussian_log_prob_from_sqrt(
+    v: Tensor,
+    L: Tensor,
+) -> Tensor:
+    """``log N(v; 0, L L^T)`` via a triangular solve (no explicit inverse)."""
+
+    z = solve_triangular(L, v.unsqueeze(-1), upper=False).squeeze(-1)
+    log_det = 2 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)
+    return -0.5 * (torch.sum(z * z, dim=-1) + log_det + v.shape[-1] * log(2 * pi))
+
+
+def _evaluate(
+    model: Model,
+    X: Tensor,
+    u: Tensor | None = None,
+    stochastic: bool = False,
+) -> Tensor:
+    """
+    Evaluate ``model`` at a set of points ``X`` with shape ``(..., N, d)``.
+
+    Points are flattened to ``(-1, d)`` before the call so user-supplied maps
+    only ever see a 2-D batch, and the input ``u`` (shape ``(..., udim)``) is
+    broadcast to every point.  ``stochastic=True`` draws from the model
+    (deterministic part + noise) instead of evaluating the deterministic part.
+    """
+
+    lead = X.shape[:-1]
+    Xf = X.reshape(-1, X.shape[-1])
+    uf = None
+    if u is not None:
+        uf = u.unsqueeze(-2).expand(*lead, u.shape[-1]).reshape(-1, u.shape[-1])
+    out = model.sample(Xf, uf) if stochastic else model(Xf, uf)
+    return out.reshape(*lead, out.shape[-1])
+
+
+def _positive_diagonal(
+    R: Tensor,
+) -> Tensor:
+    """Row signs that make the diagonal of an upper-triangular ``R`` positive."""
+
+    return torch.where(torch.diagonal(R, dim1=-2, dim2=-1) < 0, -1.0, 1.0).to(R.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -16,28 +84,24 @@ def kalman_gain(
     U: Tensor,
     Sinv: Tensor | None = None
 ) -> Tensor:
-    
-    """
-    Compute the Kalman gain ``U @ S^-1`` using the cheapest factorization that
-    is already up-to-date on ``dist``:
 
-    * if ``Sinv`` is supplied, just multiply
-    * else if the dense covariance is fresh, defer to ``torch.linalg.solve``
-    * else use a two-stage triangular solve on the cached Cholesky factor
+    """
+    Kalman gain ``K = U S^{-1}``, where ``S`` is the covariance of ``dist``
+    (the predicted observation), using the cheapest factorization available:
+
+    * ``Sinv`` supplied -> one matmul
+    * Cholesky factor of ``S`` already cached (e.g. after evaluating the
+      likelihood) -> ``cholesky_solve``
+    * otherwise -> ``torch.linalg.solve`` on the dense ``S``
     """
 
     if Sinv is not None:
-        K = U @ Sinv
-    elif dist._cov is not None and not dist._cov._sqrt_up_to_date:
-        K = torch.linalg.solve(dist.cov, U, left=False)
-    else:
-        K = solve_triangular(
-            dist.sqrt_cov,
-            solve_triangular(dist.sqrt_cov, U, upper=False, left=False),
-            upper=False, left=False,
-        )
+        return U @ Sinv
+    if dist._cov._sqrt_up_to_date:
+        # K^T = S^{-1} U^T with S = L L^T
+        return torch.cholesky_solve(U.mT, dist.sqrt_cov, upper=False).mT
+    return torch.linalg.solve(dist.cov, U, left=False)
 
-    return K
 
 def kalman_update(
     y: Tensor,
@@ -46,12 +110,26 @@ def kalman_update(
     U: Tensor,
     Sinv: Tensor | None = None
 ) -> FilteringDistribution:
-    
+
+    """
+    Gaussian conditioning on ``y`` given the joint moments of (x, y):
+
+        K = U S^{-1},   m = m^- + K (y - mu_y),   P = P^- - K U^T
+
+    Returns a new distribution; the inputs are not modified.  Quadrature
+    weights are carried over so the next predict can re-use them.
+    """
+
     K = kalman_gain(dist_y, U, Sinv)
 
-    dist_x.mean = dist_x.mean + torch.einsum('...ij, ...j -> ...i', K, (y - dist_y.mean))
-    dist_x.cov = dist_x.cov - K @ U.T
-    return dist_x
+    return FilteringDistribution(
+        mean=dist_x.mean + torch.einsum('...ij,...j->...i', K, y - dist_y.mean),
+        cov=dist_x.cov - K @ U.mT,
+        quad_points=dist_x.quad_points,
+        mean_weights=dist_x.mean_weights,
+        cov_weights=dist_x.cov_weights,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Standard Kalman / EnKF predict & update
@@ -65,18 +143,20 @@ def kf_predict(
 ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
 
     """
-    Linear-Gaussian Kalman predict.  Computes ``U = Sigma A^T`` once and
-    reuses it as both the cross-covariance and the building block for the
-    propagated covariance ``A Sigma A^T + Q = A U + Q``.
+    Push a Gaussian through a linear-Gaussian model ``A x + B u + noise``.
+
+    Computes ``U = P A^T`` once and reuses it both as the cross-covariance and
+    for the propagated covariance ``A P A^T + Q = A U + Q``.
     """
 
-    U = dist.cov @ model.mat_x.T
+    U = dist.cov @ model.mat_x.mT
     dist = FilteringDistribution(
-        mean = model(dist.mean, u),
-        cov = model.mat_x @ U + model.noise_cov
+        mean=model(dist.mean, u),
+        cov=model.mat_x @ U + model.noise_cov
     )
 
     return (dist, U) if crossCov else dist
+
 
 def enkf_predict(
     model: Model,
@@ -84,12 +164,12 @@ def enkf_predict(
     u: Tensor = None,
     crossCov: bool = False
 ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-    
+
     """Ensemble Kalman predict: draws fresh particles via ``model.sample`` and,
     if requested, returns the propagated mean / cov together with the
     cross-covariance between the input and propagated particles.
     """
-    
+
     dist_Y = FilteringDistribution(particles=model.sample(dist.particles, u))
 
     if crossCov:
@@ -97,11 +177,12 @@ def enkf_predict(
         res_Y = dist_Y.particles - dist_Y.mean
         dist_Y.cov = (res_Y.T @ res_Y) / (dist_Y.size - 1)
 
-        if dist.mean is None:
-            dist.mean = torch.mean(dist.particles, 0)
-        U = ((dist.particles - dist.mean).T @ res_Y) / (dist.size - 1)
+        mean_X = dist.mean if dist.mean is not None else torch.mean(dist.particles, 0)
+        U = ((dist.particles - mean_X).T @ res_Y) / (dist.size - 1)
+        return dist_Y, U
 
-    return (dist_Y, U) if crossCov else dist_Y
+    return dist_Y
+
 
 def enkf_update(
     y: Tensor,
@@ -110,17 +191,14 @@ def enkf_update(
     U: Tensor,
     Sinv: Tensor = None
 ) -> FilteringDistribution:
-        
-    v = y - dist_y.particles
+
+    """Stochastic EnKF update: shift each member by ``K (y - y_i)``."""
+
     K = kalman_gain(dist_y, U, Sinv)
+    v = y - dist_y.particles
 
-    dist_x.particles = dist_x.particles + torch.einsum('ij, bj -> bi', K, v)
+    return FilteringDistribution(particles=dist_x.particles + v @ K.T)
 
-    dist_x.mean = None
-    dist_x.cov = None
-
-    return dist_x
-    
 
 # ---------------------------------------------------------------------------
 # Deterministic-quadrature predict (UT / GH / Cubature)
@@ -132,63 +210,62 @@ def gaussian_quadrature(
     u: Tensor = None,
     crossCov: bool = False,
 ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-    
-    """Propagate (particles, mean_weights, cov_weights) through ``model`` and
-    aggregate the moments.  Works for any quadrature rule that supplies
-    matching weights (unscented, Gauss-Hermite, cubature, etc.)."""
+
+    """
+    Push quadrature points through ``model`` and aggregate the moments.
+
+    The deterministic part of the model moves the points; for an additive
+    model the stochastic part contributes its noise covariance exactly.
+    Works for any rule that supplies (particles, mean_weights, cov_weights):
+    unscented, Gauss-Hermite, cubature.  Particles have shape ``(..., N, d)``.
+    """
 
     additive = isinstance(model, AdditiveModel)
+    wm, wc = dist_X.mean_weights, dist_X.cov_weights
 
-    Y = model(dist_X.particles, u) if additive else model.sample(dist_X.particles, u)
-
-    Ymean = torch.sum(Y * dist_X.mean_weights.unsqueeze(-1), dim=0, keepdims=False)
-
+    Y = _evaluate(model, dist_X.particles, u, stochastic=not additive)
+    Ymean = torch.einsum('n,...nd->...d', wm, Y)
     res_Y = Y - Ymean.unsqueeze(-2)
-    P = (res_Y.T * dist_X.cov_weights) @ res_Y
-    
+    P = torch.einsum('...nd,n,...ne->...de', res_Y, wc, res_Y)
+
     if additive:
         P = P + model.noise_cov
 
     dist_Y = FilteringDistribution(
-        mean=Ymean, 
-        cov=P, 
+        mean=Ymean,
+        cov=P,
         particles=Y,
         quad_points=dist_X.quad_points,
-        mean_weights=dist_X.mean_weights,
-        cov_weights=dist_X.cov_weights
+        mean_weights=wm,
+        cov_weights=wc,
     )
-        
+
     if crossCov:
-        res_X = dist_X.particles - torch.sum(
-            dist_X.particles.T * dist_X.mean_weights, 1, keepdims=True
-        ).T
-        U = (res_X.T * dist_X.cov_weights) @ res_Y
+        Xmean = torch.einsum('n,...nd->...d', wm, dist_X.particles)
+        res_X = dist_X.particles - Xmean.unsqueeze(-2)
+        U = torch.einsum('...nd,n,...ne->...de', res_X, wc, res_Y)
         return dist_Y, U
-    
-    else:
-        return dist_Y
+
+    return dist_Y
 
 
 # ---------------------------------------------------------------------------
 # Square-root Kalman primitives
 #
-# These never materialize the dense covariance; they manipulate Cholesky
-# factors via QR factorizations of stacked sqrt-matrices.  The resulting
-# Cholesky factors are returned with positive diagonals.
+# These never materialize a dense covariance; they manipulate Cholesky
+# factors via QR factorizations of stacked square-root matrices.  Resulting
+# Cholesky factors have positive diagonals.
 # ---------------------------------------------------------------------------
 
 def _qr_chol(stacked: Tensor) -> Tensor:
     """
-    Given a (n, m) matrix M with ``M @ M.T == Sigma``, return a lower-triangular
-    Cholesky factor ``L`` of ``Sigma`` with positive diagonal.
+    Given ``M`` with shape ``(..., n, m)`` and ``M M^T = Sigma``, return the
+    lower-triangular Cholesky factor of ``Sigma`` with positive diagonal.
     """
-    # QR of M^T yields R upper triangular with R^T R = M M^T = Sigma.
-    R = torch.linalg.qr(stacked.T, mode='reduced').R
-    L = R.T
-    # Flip column signs so the diagonal of L is positive.
-    diag = torch.diagonal(L)
-    sign = torch.where(diag < 0, -torch.ones_like(diag), torch.ones_like(diag))
-    return L * sign.unsqueeze(0)
+
+    # QR of M^T yields upper-triangular R with R^T R = M M^T.
+    R = torch.linalg.qr(stacked.mT, mode='reduced').R
+    return (R * _positive_diagonal(R).unsqueeze(-1)).mT
 
 
 def srkf_predict(
@@ -196,39 +273,23 @@ def srkf_predict(
     dist: FilteringDistribution,
     u: Tensor = None,
     crossCov: bool = False,
-) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
+) -> Tuple[FilteringDistribution, None] | FilteringDistribution:
     """
-    Square-root Kalman predict.  Operates entirely on Cholesky factors:
-    forms ``[A L_x | L_Q]`` and reads the new Cholesky factor off its QR.
+    Square-root predict through a linear-Gaussian model: the new Cholesky
+    factor is read off the QR of ``[A L_x | L_Q]``.
 
-    Cross-covariance ``U = Sigma A^T = L_x_pred (A L_x_pred^{-1}) ...`` — we
-    return the dense ``U`` to keep the update step uniform with `kf_predict`,
-    but it is computed from the freshly-propagated sqrt factor without ever
-    forming a full ``L_x L_x^T``.
+    The square-root update forms its own cross terms, so ``crossCov=True``
+    returns ``None`` in place of a cross-covariance.
     """
 
-    L_x = dist.sqrt_cov
-    A = model.mat_x
-    L_Q = model.sqrt_noise_cov
-
-    AL = A @ L_x
-    stacked = torch.cat([AL, L_Q], dim=1)
-    L_x_pred = _qr_chol(stacked)
-
+    AL = model.mat_x @ dist.sqrt_cov
+    L_Q = model.sqrt_noise_cov.expand(*AL.shape[:-2], *model.sqrt_noise_cov.shape)
     new_dist = FilteringDistribution(
         mean=model(dist.mean, u),
-        sqrt_cov=L_x_pred,
+        sqrt_cov=_qr_chol(torch.cat([AL, L_Q], dim=-1)),
     )
 
-    if crossCov:
-        # U = Sigma_x_pred (no cross-product yet); we want Cov(x_pred, x_pred) A^T
-        # is not the right cross-cov in the standard Kalman update -- here U is
-        # used as a placeholder Cov(x_prior, x_pred). For the joint observation
-        # update we need Sigma_pred H^T separately. Return None and let the
-        # SR update compute it directly.
-        return new_dist, None
-
-    return new_dist
+    return (new_dist, None) if crossCov else new_dist
 
 
 def srkf_update(
@@ -236,63 +297,55 @@ def srkf_update(
     dist_x: FilteringDistribution,
     model: LinearGaussianModel,
     u: Tensor | None = None,
-    Sinv: Tensor | None = None,
-) -> FilteringDistribution:
+    compute_log_prob: bool = False,
+) -> Tuple[FilteringDistribution, Tensor | None]:
     """
-    Square-root Kalman update.  Stacks the pre-array
+    Square-root update through a linear-Gaussian observation model.  QR of the
+    pre-array
 
         [ L_R^T          0       ]
         [ L_pred^T H^T   L_pred^T ]
 
-    Applying QR triangularizes it to
+    gives the upper-triangular
 
         [ L_S^T   F^T          ]
         [   0     L_xpost^T    ]
 
-    from which we read off the innovation-covariance Cholesky factor ``L_S``,
-    the posterior-covariance Cholesky factor ``L_xpost``, and the gain
-    ``K = F^T L_S^{-1}`` via a triangular solve.
+    with innovation-covariance factor ``L_S``, posterior factor ``L_xpost``
+    and gain ``K = F L_S^{-1}``.  The marginal-likelihood term
+    ``log N(y; y_pred, S)`` is evaluated from ``L_S`` directly, so the dense
+    innovation covariance is never formed.
+
+    Returns ``(posterior, log_lik)``; ``log_lik`` is None unless requested.
     """
 
     H = model.mat_x
-    L_R = model.sqrt_noise_cov
     L_pred = dist_x.sqrt_cov
-    y_pred = model(dist_x.mean, u)
+    batch = L_pred.shape[:-2]
+    L_R = model.sqrt_noise_cov.expand(*batch, *model.sqrt_noise_cov.shape)
+    xdim, ydim = L_pred.shape[-1], L_R.shape[-1]
 
-    xdim = L_pred.shape[0]
-    ydim = L_R.shape[0]
+    top = torch.cat([L_R.mT, L_R.new_zeros(*batch, ydim, xdim)], dim=-1)
+    bot = torch.cat([(H @ L_pred).mT, L_pred.mT], dim=-1)
+    R = torch.linalg.qr(torch.cat([top, bot], dim=-2), mode='reduced').R
 
-    top = torch.cat([L_R.T, torch.zeros(ydim, xdim)], dim=1)
-    bot = torch.cat([(H @ L_pred).T, L_pred.T], dim=1)
-    pre_array = torch.cat([top, bot], dim=0)
+    L_S_T, F_T, L_xpost_T = R[..., :ydim, :ydim], R[..., :ydim, ydim:], R[..., ydim:, ydim:]
 
-    R = torch.linalg.qr(pre_array, mode='reduced').R
-    # R is upper-triangular with the blocks we need on the diagonal:
-    #   R[:ydim, :ydim] = L_S^T  -> innovation cov sqrt
-    #   R[:ydim, ydim:] = F^T    -> K L_S^T
-    #   R[ydim:, ydim:] = L_xpost^T
-    L_S_T = R[:ydim, :ydim]
-    F_T = R[:ydim, ydim:]
-    L_xpost_T = R[ydim:, ydim:]
+    sign_S = _positive_diagonal(L_S_T).unsqueeze(-1)
+    L_S_T, F_T = L_S_T * sign_S, F_T * sign_S
+    L_xpost_T = L_xpost_T * _positive_diagonal(L_xpost_T).unsqueeze(-1)
 
-    # Fix signs so Cholesky factors have positive diagonals
-    sign_S = torch.where(torch.diagonal(L_S_T) < 0, -1.0, 1.0)
-    L_S_T = L_S_T * sign_S.unsqueeze(1)
-    F_T = F_T * sign_S.unsqueeze(1)
+    # F^T = L_S^T K^T  ->  K = (L_S^{-T} F^T)^T
+    K = solve_triangular(L_S_T, F_T, upper=True).mT
 
-    sign_x = torch.where(torch.diagonal(L_xpost_T) < 0, -1.0, 1.0)
-    L_xpost_T = L_xpost_T * sign_x.unsqueeze(1)
+    v = y - model(dist_x.mean, u)  # innovation
+    posterior = FilteringDistribution(
+        mean=dist_x.mean + torch.einsum('...ij,...j->...i', K, v),
+        sqrt_cov=L_xpost_T.mT,
+    )
+    log_lik = _gaussian_log_prob_from_sqrt(v, L_S_T.mT) if compute_log_prob else None
 
-    # K = F L_S^{-T} L_S^{-1}; with two triangular solves on L_S^T:
-    # F = K L_S^T  ->  K = F (L_S^T)^{-1}
-    K = solve_triangular(L_S_T, F_T, upper=True, left=True).T
-    # K shape: (xdim, ydim)
-
-    innovation = y - y_pred
-    new_mean = dist_x.mean + torch.einsum('ij, j -> i', K, innovation)
-
-    new_dist = FilteringDistribution(mean=new_mean, sqrt_cov=L_xpost_T.T)
-    return new_dist
+    return posterior, log_lik
 
 
 # ---------------------------------------------------------------------------
@@ -306,35 +359,25 @@ def bootstrap_pf_predict(
 ) -> FilteringDistribution:
     """Bootstrap proposal: sample x_t^i ~ p(x_t | x_{t-1}^i)."""
 
-    new_particles = model.sample(dist.particles, u)
-    new_dist = FilteringDistribution(
-        particles=new_particles,
-        log_weights=dist.log_weights.clone() if dist.log_weights is not None else None,
+    return FilteringDistribution(
+        particles=model.sample(dist.particles, u),
+        log_weights=dist.log_weights,
     )
-    return new_dist
 
 
 def particle_log_likelihood(
     y: Tensor,
     particles: Tensor,
     observation_model: AdditiveModel,
+    u: Tensor | None = None,
 ) -> Tensor:
     """
-    Per-particle log-likelihood log p(y | x_i) for an additive-Gaussian
-    observation model: ``y - h(x_i) ~ N(0, R)``.  Uses solve_triangular on
-    the Cholesky factor (never forms R^-1).
+    Per-particle log-likelihood ``log p(y | x_i)`` for an additive-Gaussian
+    observation model ``y - h(x_i) ~ N(0, R)``.
     """
 
-    h = observation_model(particles, None) if hasattr(observation_model, 'model') else observation_model(particles)
-    residuals = y.unsqueeze(0) - h  # (N, ydim)
-    L_R = observation_model.sqrt_noise_cov
-    # Mahalanobis term per particle
-    sol = solve_triangular(L_R, residuals.T, upper=False)  # (ydim, N)
-    mahal = torch.sum(sol * sol, dim=0)  # (N,)
-    log_det = 2 * torch.sum(torch.log(torch.diagonal(L_R)))
-    from math import log as _log, pi as _pi
-    ydim = y.shape[-1]
-    return -0.5 * (mahal + log_det + ydim * _log(2 * _pi))
+    residuals = y - _evaluate(observation_model, particles, u)  # (N, ydim)
+    return _gaussian_log_prob_from_sqrt(residuals, observation_model.sqrt_noise_cov)
 
 
 def particle_filter_update(
@@ -343,6 +386,7 @@ def particle_filter_update(
     observation_model: AdditiveModel,
     resample_threshold: float | None = 0.5,
     resample_method: str = 'systematic',
+    u: Tensor | None = None,
 ) -> Tuple[FilteringDistribution, Tensor]:
     """
     Bootstrap-PF measurement update.  Returns the updated distribution and the
@@ -350,20 +394,20 @@ def particle_filter_update(
     ``log p(y_t | y_{1:t-1}) = logsumexp(log_w_prev + log p(y|x_i))``.
     """
 
-    log_lik = particle_log_likelihood(y, dist.particles, observation_model)
+    log_lik = particle_log_likelihood(y, dist.particles, observation_model, u)
     prev_log_w = dist.log_weights
     if prev_log_w is None:
-        from math import log as _log
-        prev_log_w = -_log(dist.size) * torch.ones(dist.size)
+        prev_log_w = torch.full((dist.size,), -log(dist.size))
     new_log_w_unnorm = prev_log_w + log_lik
-    # log-marginal-likelihood contribution = logsumexp of unnormalized log weights.
     log_marg = torch.logsumexp(new_log_w_unnorm, dim=0)
-    # Normalize for storage
-    dist.log_weights = new_log_w_unnorm - log_marg
+
+    new_dist = FilteringDistribution(
+        particles=dist.particles,
+        log_weights=new_log_w_unnorm - log_marg,
+    )
 
     if resample_threshold is not None:
-        ess = dist.effective_sample_size()
-        if ess < resample_threshold * dist.size:
-            dist.resample(method=resample_method)
+        if new_dist.effective_sample_size() < resample_threshold * new_dist.size:
+            new_dist.resample(method=resample_method)
 
-    return dist, log_marg
+    return new_dist, log_marg

@@ -1,6 +1,5 @@
 """DMD / DMDc tests."""
 
-import pytest
 import torch
 
 import bside

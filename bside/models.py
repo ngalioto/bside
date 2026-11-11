@@ -109,8 +109,8 @@ class Matrix(torch.nn.Module):
         
         try:
             return torch.linalg.inv(self.val)
-        except:
-            raise ValueError('Matrix is not invertible')
+        except torch.linalg.LinAlgError as err:
+            raise ValueError('Matrix is not invertible') from err
 
     def forward(
         self,
@@ -168,14 +168,15 @@ class PSDMatrix(Matrix):
                 # Materialize the dense form once so the Matrix base class has shape/default
                 # to work with. Downstream operations still prefer the cached Cholesky factor.
                 default = default_sqrt @ default_sqrt.T
-        elif default is not None:
-            self._sqrt_val = torch.linalg.cholesky(default, upper=False)
+        else:
+            # Lazy: the Cholesky factor is computed on first access to `.sqrt`.
+            self._sqrt_val = None
 
         super().__init__(default, mask, indices)
 
         self.sqrt_only = sqrt_only
         self._up_to_date = True
-        self._sqrt_up_to_date = True
+        self._sqrt_up_to_date = default_sqrt is not None
 
         self._inv_val = None
         self._inv_up_to_date = False

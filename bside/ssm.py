@@ -1,8 +1,7 @@
 import torch
 from torch import Tensor
 from bside.dynamics import Model, IdentityModel
-from bside.dataset import Data, DataTrajectories
-from typing import Union, Tuple, Callable
+from typing import Tuple
 
 
 class SSM(torch.nn.Module):

@@ -1,3 +1,5 @@
+import copy
+
 import torch
 from torch import Tensor
 from torch.linalg import solve_triangular
@@ -5,6 +7,51 @@ from numpy.polynomial.hermite import hermgauss
 from math import log, sqrt, pi
 
 from bside.models import PSDMatrix
+
+
+class Covariance:
+    """
+    Covariance of a state distribution with lazily cached dense, Cholesky and
+    inverse forms.  Same interface as `PSDMatrix`, but a plain object rather
+    than an ``nn.Module``: filters create one per step, and model covariances
+    (which carry learnable parameters) are the only ones that need to be
+    modules.
+    """
+
+    def __init__(
+        self,
+        val: Tensor | None = None,
+        sqrt: Tensor | None = None
+    ) -> None:
+
+        self._val, self._sqrt_val, self._inv_val = val, sqrt, None
+        self._up_to_date = val is not None
+        self._sqrt_up_to_date = sqrt is not None
+        self._inv_up_to_date = False
+
+    @property
+    def val(self) -> Tensor:
+        if not self._up_to_date:
+            self._val = self._sqrt_val @ self._sqrt_val.mT
+            self._up_to_date = True
+        return self._val
+
+    @property
+    def sqrt(self) -> Tensor:
+        if not self._sqrt_up_to_date:
+            self._sqrt_val = torch.linalg.cholesky(self._val, upper=False)
+            self._sqrt_up_to_date = True
+        return self._sqrt_val
+
+    @property
+    def inv(self) -> Tensor:
+        if not self._inv_up_to_date:
+            self._inv_val = torch.cholesky_inverse(self.sqrt, upper=False)
+            self._inv_up_to_date = True
+        return self._inv_val
+
+    def update(self) -> None:
+        """No learnable parameters; present for interface parity with `PSDMatrix`."""
 
 
 class FilteringDistribution:
@@ -55,13 +102,13 @@ class FilteringDistribution:
         elif isinstance(cov, PSDMatrix):
             self._cov = cov
         elif cov is not None:
-            self._cov = PSDMatrix(cov)
+            self._cov = Covariance(val=cov)
         else:
             # square-root only construction
-            self._cov = PSDMatrix(default_sqrt=sqrt_cov)
+            self._cov = Covariance(sqrt=sqrt_cov)
         self._particles = particles
         self.quad_points = quad_points
-        self.size = 0 if particles is None else particles.shape[0]
+        self.size = 0 if particles is None else particles.shape[-2]
         self.mean_weights = mean_weights
         self.cov_weights = cov_weights
         self.log_weights = log_weights
@@ -79,14 +126,10 @@ class FilteringDistribution:
         value: Tensor | None
     ) -> None:
 
-        if value is None:
-            self._cov = None
-        elif self._cov is None:
-            self._cov = value if isinstance(value, PSDMatrix) else PSDMatrix(value)
-        elif isinstance(value, PSDMatrix):
+        if value is None or isinstance(value, PSDMatrix):
             self._cov = value
         else:
-            self._cov.val = value
+            self._cov = Covariance(val=value)
     
     @property
     def sqrt_cov(
@@ -101,10 +144,7 @@ class FilteringDistribution:
         value: Tensor
     ) -> None:
         
-        if self._cov is None:
-            self._cov = PSDMatrix(default_sqrt=value)
-        else:
-            self._cov.sqrt = value
+        self._cov = Covariance(sqrt=value)
     
     @property
     def inv_cov(
@@ -128,6 +168,25 @@ class FilteringDistribution:
         if self._cov is not None:
             self._cov.update()
 
+    def snapshot(
+        self
+    ) -> "FilteringDistribution":
+        """
+        Cheap, independent copy for storing a filtering history.
+
+        Tensors are shared (filters never modify them in place), but the
+        attribute dictionary and the covariance cache are copied, so later
+        reassignments on ``self`` do not leak into the snapshot.  This replaces
+        a per-timestep ``copy.deepcopy``.
+        """
+
+        new = object.__new__(FilteringDistribution)
+        new.__dict__ = self.__dict__.copy()
+        if self._cov is not None:
+            new._cov = copy.copy(self._cov)
+        new.hyper_params = dict(self.hyper_params)
+        return new
+
     @property
     def particles(
         self
@@ -142,7 +201,7 @@ class FilteringDistribution:
     ) -> None:
             
         self._particles = value
-        self.size = value.shape[0] if value is not None else 0
+        self.size = value.shape[-2] if value is not None else 0
 
     # ------------------------------------------------------------------
     # Gaussian likelihood
@@ -158,21 +217,22 @@ class FilteringDistribution:
         Gaussian log probability at ``x``.  Uses ``solve_triangular`` on the
         Cholesky factor for the Mahalanobis term so we never form the inverse.
 
-        Returns a 0-D tensor when ``x`` is a single point, or a 1-D tensor of
-        per-point log-densities when ``x`` is a (batch, dim) tensor.
+        Broadcasts over leading (batch) dimensions of ``x``, ``mean`` and
+        ``cov``: a single point gives a 0-D tensor, a ``(..., dim)`` input gives
+        a ``(...)`` tensor of log-densities.
         """
 
-        single = x.ndim == 1
-        v = torch.atleast_2d(x - self.mean)
-        log_prob = torch.sum(solve_triangular(self.sqrt_cov, v.T, upper=False)**2, axis=-2) # Mahalanobis distance
+        L = self.sqrt_cov
+        v = x - self.mean
+        z = solve_triangular(L, v.unsqueeze(-1), upper=False).squeeze(-1)
+        log_prob = torch.sum(z * z, dim=-1)  # Mahalanobis distance
 
         if normalize:
-            log_det = 2 * torch.sum(torch.log(torch.diagonal(self.sqrt_cov, dim1=-2, dim2=-1)), axis=-1)
-            log_prob = log_prob + log_det + self.dim * log(2*pi)
+            log_det = 2 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)
+            log_prob = log_prob + log_det + self.dim * log(2 * pi)
 
-        result = -0.5 * log_prob
-        return result.squeeze(0) if single else result
-    
+        return -0.5 * log_prob
+
     def sample(
         self,
         n: int
@@ -180,7 +240,7 @@ class FilteringDistribution:
         
         """Draw ``n`` samples from this Gaussian via the cached Cholesky factor."""
         
-        return torch.randn(n, self.dim) @ self.sqrt_cov.T + self.mean
+        return torch.randn(n, self.dim) @ self.sqrt_cov.mT + self.mean
 
     def sample_particles(
         self,
@@ -274,23 +334,34 @@ class FilteringDistribution:
     # Quadrature point generators
     # ------------------------------------------------------------------
 
+    def _scaled_sqrt_cov(
+        self,
+        scale: float
+    ) -> Tensor:
+        """
+        ``scale * L^T`` where ``L`` is the (cached) lower Cholesky factor of the
+        covariance.  Row ``i`` of the result is ``scale`` times the ``i``-th
+        *column* of ``L``, which is the direction used by sigma / cubature
+        points:  x_i = m + scale * L[:, i].
+        """
+
+        try:
+            L = self.sqrt_cov
+        except torch.linalg.LinAlgError as err:
+            raise ValueError(
+                "Cannot form quadrature points: the covariance is not positive definite."
+            ) from err
+        return scale * L.mT
+
     def form_ut_points(
         self,
         lmbda: float
     ) -> None:
-        """Unscented transform sigma points around (mean, cov)."""
-        
-        n = self.dim
-        L, info = torch.linalg.cholesky_ex(self.cov)
-        if info.any():
-            self.particles = None
-            return
-        scaling = sqrt(n + lmbda)
-        scaledL = L * scaling
-        self.particles = torch.zeros(2 * n + 1, n)
-        self.particles[0] = self.mean
-        self.particles[1:n+1] = self.mean + scaledL
-        self.particles[n+1:] = self.mean - scaledL
+        """Unscented transform sigma points around (mean, cov): m, m +/- sqrt(n+lambda) L[:, i]."""
+
+        offsets = self._scaled_sqrt_cov(sqrt(self.dim + lmbda))  # (..., n, n)
+        m = self.mean.unsqueeze(-2)                               # (..., 1, n)
+        self.particles = torch.cat([m, m + offsets, m - offsets], dim=-2)
 
     def form_ut_weights(
         self,
@@ -319,14 +390,9 @@ class FilteringDistribution:
     def form_gh_points(
         self
     ) -> None:
-        """Gauss-Hermite quadrature nodes scaled to (mean, cov)."""
-        
-        L, info = torch.linalg.cholesky_ex(self.cov)
-        if info.any():
-            self.particles = None
-            return
-        scaledL = sqrt(2) * L
-        self.particles = self.quad_points @ scaledL.T + self.mean
+        """Gauss-Hermite quadrature nodes scaled to (mean, cov): x = m + sqrt(2) L xi."""
+
+        self.particles = self.quad_points @ self._scaled_sqrt_cov(sqrt(2)) + self.mean.unsqueeze(-2)
 
     def form_gh_weights(
         self,
@@ -359,18 +425,12 @@ class FilteringDistribution:
     ) -> None:
         """3rd-order spherical cubature points around (mean, cov).
 
-        Arasaratnam & Haykin (2009), 2n points at +/- sqrt(n) * e_i.
+        Arasaratnam & Haykin (2009), 2n points m +/- sqrt(n) L[:, i].
         """
 
-        n = self.dim
-        L, info = torch.linalg.cholesky_ex(self.cov)
-        if info.any():
-            self.particles = None
-            return
-        scaledL = sqrt(n) * L
-        self.particles = torch.zeros(2 * n, n)
-        self.particles[:n] = self.mean + scaledL
-        self.particles[n:] = self.mean - scaledL
+        offsets = self._scaled_sqrt_cov(sqrt(self.dim))
+        m = self.mean.unsqueeze(-2)
+        self.particles = torch.cat([m + offsets, m - offsets], dim=-2)
 
     def form_cubature_weights(
         self

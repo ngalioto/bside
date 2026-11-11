@@ -70,19 +70,21 @@ class Data:
             if self.y.ndim == 1:
                 self.y = self.y[...,None]
             
-            self.ydim = self.y.shape[1]
-            self.size = self.y.shape[0]
+            # Layout is (..., T, ydim): an optional leading batch of equal-length
+            # trajectories, then time, then the observation dimension.
+            self.ydim = self.y.shape[-1]
+            self.size = self.y.shape[-2]
 
             if u is not None:
-                if not isinstance(y, torch.Tensor) and not isinstance(y, ndarray):
-                    raise TypeError("y must be a PyTorch tensor or a numpy array.")
+                if not isinstance(u, torch.Tensor) and not isinstance(u, ndarray):
+                    raise TypeError("u must be a PyTorch tensor or a numpy array.")
                 
                 self.u = torch.tensor(u, dtype=torch.float32) if isinstance(u, ndarray) else u
 
                 if self.u.ndim == 1:
                     self.u = self.u.unsqueeze(1)
-                self.udim = self.u.shape[1]
-                if self.u.shape[0] != self.size:
+                self.udim = self.u.shape[-1]
+                if self.u.shape[-2] != self.size:
                     raise ValueError("There must be the same number of samples in the state and control input data.")
             else:
                 self.u = None
@@ -130,6 +132,14 @@ class Data:
         """
 
         return self.size
+
+    @property
+    def batch_shape(
+        self
+    ) -> torch.Size:
+        """Leading batch dimensions of ``y`` (empty for a single trajectory)."""
+
+        return torch.Size() if self.y is None else self.y.shape[:-2]
 
     def __getitem__(
         self, 
@@ -375,7 +385,7 @@ class DataTrajectories:
         Normalizes the data. If the data is already normalized, this function does nothing.
         """  
 
-        if self.norm == False:
+        if not self.norm:
             self.y_mean = self.y.mean(dim=0)
             self.y_std = self.y.std(dim=0)
             self.y = (self.y - self.y_mean) / self.y_std
@@ -393,7 +403,7 @@ class DataTrajectories:
         Unnormalizes the data. If the data is not normalized, this function does nothing.
         """
         
-        if self.norm == True:
+        if self.norm:
             self.y = self.y * self.y_std + self.y_mean
             if self.u is not None:
                 self.u = self.u * self.u_std + self.u_mean

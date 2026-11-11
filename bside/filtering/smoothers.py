@@ -16,22 +16,21 @@ list of `FilteringDistribution` objects of the same length, containing the
 smoothed marginals.
 """
 
-import copy
-from typing import List
+from typing import List, Tuple
 from math import log, pi
 
 import torch
 from torch import Tensor
 from torch.linalg import solve_triangular
 
-from bside.dynamics import AdditiveModel, LinearGaussianModel, Model
+from bside.dynamics import AdditiveModel, LinearGaussianModel
 from bside.ssm import SSM
 from bside.filtering import functional as F
 from bside.filtering.distributions import FilteringDistribution
 
 
 # ---------------------------------------------------------------------------
-# Gain helper shared by RTS / URTS
+# Backward step shared by RTS / URTS
 # ---------------------------------------------------------------------------
 
 def _smoothing_gain(
@@ -40,33 +39,102 @@ def _smoothing_gain(
     sqrt_P_pred: Tensor | None = None,
 ) -> Tensor:
     """
-    Smoothing gain ``C = U P_pred^{-1}``.
+    Smoothing gain ``G = U P_pred^{-1}`` with ``U = Cov[x_k, x_{k+1} | y_{1:k}]``.
 
-    Uses two triangular solves on the Cholesky factor when available
-    (avoids forming P_pred^{-1}), otherwise falls back to ``linalg.solve``
-    on the dense matrix.
+    Uses ``cholesky_solve`` when the Cholesky factor of ``P_pred`` is given,
+    otherwise ``linalg.solve`` on the dense matrix (never an explicit inverse).
     """
 
     if sqrt_P_pred is not None:
-        return solve_triangular(
-            sqrt_P_pred,
-            solve_triangular(sqrt_P_pred, U, upper=False, left=False),
-            upper=False, left=False,
-        )
+        return torch.cholesky_solve(U.mT, sqrt_P_pred, upper=False).mT
     return torch.linalg.solve(P_pred, U, left=False)
+
+
+def _rts_backward_step(
+    dist_f: FilteringDistribution,
+    dist_p: FilteringDistribution,
+    U: Tensor,
+    dist_s_next: FilteringDistribution,
+) -> Tuple[FilteringDistribution, Tensor]:
+    """
+    One backward (RTS) step, common to every Gaussian smoother:
+
+        G   = U P_pred^{-1}
+        m^s = m + G (m^s_{k+1} - m_pred)
+        P^s = P + G (P^s_{k+1} - P_pred) G^T
+
+    The predicted moments ``(m_pred, P_pred)`` and cross-covariance ``U`` come
+    from pushing the filtered distribution through the dynamics model; only
+    that predict unit differs between RTS and its sigma-point variants.
+    """
+
+    G = _smoothing_gain(U, dist_p.cov)
+    mean = dist_f.mean + torch.einsum('...ij,...j->...i', G, dist_s_next.mean - dist_p.mean)
+    cov = dist_f.cov + G @ (dist_s_next.cov - dist_p.cov) @ G.mT
+    return FilteringDistribution(mean=mean, cov=cov), G
+
+
+def _input_at(u: Tensor | None, k: int) -> Tensor | None:
+    return None if u is None else u[..., k, :]
+
+
+class _GaussianSmoother:
+    """
+    Backward pass shared by the Gaussian smoothers.  Subclasses supply
+    `_predict(dist_f, u)`, which pushes the filtered distribution at ``k``
+    through the dynamics model and returns ``(p(x_{k+1} | y_{1:k}), U)``.
+    """
+
+    def _predict(
+        self,
+        dist_f: FilteringDistribution,
+        u: Tensor | None,
+    ) -> Tuple[FilteringDistribution, Tensor]:
+        raise NotImplementedError
+
+    def smooth(
+        self,
+        filtered_history: List[FilteringDistribution],
+        u: Tensor | None = None,
+        return_gains: bool = False,
+    ) -> List[FilteringDistribution] | Tuple[List[FilteringDistribution], List[Tensor]]:
+        """
+        Parameters
+        ----------
+        filtered_history : list of FilteringDistribution
+            Output of ``filter(..., return_history=True)``; entry ``k`` is
+            ``p(x_k | y_{...k})``.  Batched histories are supported.
+        u : Tensor, optional
+            Inputs with shape ``(..., T, udim)`` -- pass ``data.u``.  Row ``k``
+            drives the transition ``x_k -> x_{k+1}`` (the same convention the
+            filter uses for either value of ``y0``).
+        return_gains : bool
+            Also return the smoothing gains ``G_k`` (``k = 0..K-1``); the lag-one
+            smoothed cross-covariance is ``Cov[x_{k+1}, x_k | y] = P^s_{k+1} G_k^T``.
+        """
+
+        T = len(filtered_history)
+        smoothed: List[FilteringDistribution] = [None] * T
+        gains: List[Tensor] = [None] * max(T - 1, 0)
+        smoothed[-1] = filtered_history[-1].snapshot()
+
+        for k in range(T - 2, -1, -1):
+            dist_f = filtered_history[k]
+            dist_p, U = self._predict(dist_f, _input_at(u, k))
+            smoothed[k], gains[k] = _rts_backward_step(dist_f, dist_p, U, smoothed[k + 1])
+
+        return (smoothed, gains) if return_gains else smoothed
 
 
 # ---------------------------------------------------------------------------
 # RTS smoother (linear-Gaussian)
 # ---------------------------------------------------------------------------
 
-class RTSSmoother:
+class RTSSmoother(_GaussianSmoother):
     """
-    Rauch-Tung-Striebel smoother for a linear-Gaussian dynamics model.
-
-    Re-uses the ``U = Sigma A^T`` matrix that the Kalman predict already
-    computes, so the smoothing gain ``C = U P_pred^{-1}`` does not require any
-    extra matrix multiplications.
+    Rauch-Tung-Striebel smoother for a linear-Gaussian dynamics model.  The
+    predict unit is the closed-form Kalman predict, which also yields the
+    cross-covariance ``U = P A^T`` at no extra cost.
     """
 
     def __init__(
@@ -80,39 +148,19 @@ class RTSSmoother:
             )
         self.model = model
 
-    def smooth(
-        self,
-        filtered_history: List[FilteringDistribution],
-    ) -> List[FilteringDistribution]:
-
-        T = len(filtered_history)
-        smoothed: List[FilteringDistribution] = [None] * T
-        smoothed[-1] = copy.deepcopy(filtered_history[-1])
-
-        for t in range(T - 2, -1, -1):
-            dist_f = filtered_history[t]
-            # Run the linear-Gaussian predict once to obtain (x_pred, P_pred, U).
-            dist_p, U = F.kf_predict(self.model.dynamics, dist_f, u=None, crossCov=True)
-            C = _smoothing_gain(U, dist_p.cov)
-            mean_s = dist_f.mean + torch.einsum('ij,j->i', C, smoothed[t + 1].mean - dist_p.mean)
-            cov_s = dist_f.cov + C @ (smoothed[t + 1].cov - dist_p.cov) @ C.T
-            smoothed[t] = FilteringDistribution(mean=mean_s, cov=cov_s)
-
-        return smoothed
+    def _predict(self, dist_f, u):
+        return F.kf_predict(self.model.dynamics, dist_f, u=u, crossCov=True)
 
 
 # ---------------------------------------------------------------------------
-# Unscented RTS smoother (and Cubature / Gauss-Hermite variants via the same predict)
+# Unscented RTS smoother
 # ---------------------------------------------------------------------------
 
-class UnscentedRTSSmoother:
+class UnscentedRTSSmoother(_GaussianSmoother):
     """
-    Unscented Rauch-Tung-Striebel smoother (Sarkka, 2008).
-
-    Works for any nonlinear additive-Gaussian dynamics model.  The
-    quadrature rule is configurable via ``predict_rule`` which must accept
-    ``(model, dist, u, crossCov)`` and return ``(predicted_dist, cross_cov)``
-    when ``crossCov=True``; the default uses standard UT sigma points.
+    Unscented Rauch-Tung-Striebel smoother (Sarkka, 2008) for additive-noise
+    dynamics.  The predict unit is the unscented transform: sigma points are
+    formed around each filtered (mean, cov) and pushed through the dynamics.
     """
 
     def __init__(
@@ -133,28 +181,11 @@ class UnscentedRTSSmoother:
         self.kappa = kappa
         self.lmbda = alpha**2 * (model.xdim + kappa) - model.xdim
 
-    def smooth(
-        self,
-        filtered_history: List[FilteringDistribution],
-    ) -> List[FilteringDistribution]:
-
-        T = len(filtered_history)
-        smoothed: List[FilteringDistribution] = [None] * T
-        smoothed[-1] = copy.deepcopy(filtered_history[-1])
-
-        for t in range(T - 2, -1, -1):
-            dist_f = copy.deepcopy(filtered_history[t])
-            # Recompute UT weights & points around the filtered (mean, cov) and
-            # propagate through dynamics so we can read off the cross-covariance.
-            dist_f.form_ut_weights(self.alpha, self.beta, self.kappa, self.lmbda)
-            dist_f.form_ut_points(self.lmbda)
-            dist_p, U = F.gaussian_quadrature(self.model.dynamics, dist_f, u=None, crossCov=True)
-            C = _smoothing_gain(U, dist_p.cov)
-            mean_s = dist_f.mean + torch.einsum('ij,j->i', C, smoothed[t + 1].mean - dist_p.mean)
-            cov_s = dist_f.cov + C @ (smoothed[t + 1].cov - dist_p.cov) @ C.T
-            smoothed[t] = FilteringDistribution(mean=mean_s, cov=cov_s)
-
-        return smoothed
+    def _predict(self, dist_f, u):
+        dist = dist_f.snapshot()
+        dist.form_ut_weights(self.alpha, self.beta, self.kappa, self.lmbda)
+        dist.form_ut_points(self.lmbda)
+        return F.gaussian_quadrature(self.model.dynamics, dist, u=u, crossCov=True)
 
 
 # ---------------------------------------------------------------------------

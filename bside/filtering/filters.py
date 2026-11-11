@@ -1,15 +1,41 @@
+"""
+Bayesian filters.
+
+A filter is assembled from the two halves of the state-space model:
+
+* a **predict** unit that pushes the state distribution through the dynamics
+  model (deterministic map + process noise), and
+* an **update** unit that pushes the predicted state through the observation
+  model (deterministic map + measurement noise) to obtain
+  ``p(y_k | y_{1:k-1})`` -- the marginal-likelihood term -- and then conditions
+  on ``y_k``.
+
+`Filter.filter` is the single recursion shared by every filter; concrete
+filters only choose which predict / update primitives to plug in (and, for the
+square-root and particle filters, override `update_step` / `predict_step`).
+The marginal likelihood ``p(y_{1:n} | theta) = prod_k p(y_k | y_{1:k-1}, theta)``
+accumulates along the way, which is what `bside.sysid.Posterior` consumes.
+
+Time convention (shared with `SSM.measure`): with ``y0=False`` data row ``t``
+holds ``y_{t+1}`` and the input ``u_t`` that drove ``x_t -> x_{t+1}``; with
+``y0=True`` row ``t`` holds ``y_t`` (the first row observes ``x_0``) and the
+step ``x_{t-1} -> x_t`` uses ``u_{t-1}``.  Either way the returned history
+satisfies ``history[k] = p(x_k | y_{...k})``, i.e. index ``k`` is state ``x_k``.
+"""
+
+from abc import ABC
+from typing import Tuple, List
+
 import torch
 from torch import Tensor
-import copy
-from typing import Tuple, List, Callable
-from abc import ABC, abstractmethod
 
 from bside.ssm import SSM
 from bside.dynamics import Model, AdditiveModel, LinearGaussianModel, LinearModel
 from bside.models import PSDMatrix
 
 from bside.dataset import Data
-from bside.filtering import FilteringDistribution, functional as F
+from bside.filtering.distributions import FilteringDistribution
+from bside.filtering import functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +51,8 @@ def _ensure_linear_gaussian(
     Wrap an `IdentityModel` (or any `LinearModel` with no noise) in a
     `LinearGaussianModel` with negligible (``eps * I``) observation noise so the
     Kalman filter can consume it uniformly. Models that are already linear-Gaussian
-    are returned unchanged.
+    are returned unchanged.  The wrapper shares the inner model, so parameter
+    updates on the original model are seen by the filter.
     """
 
     if isinstance(model, LinearGaussianModel):
@@ -40,8 +67,14 @@ def _ensure_linear_gaussian(
     )
 
 
+def _input_at(u: Tensor | None, t: int) -> Tensor | None:
+    """Input at time row ``t`` of a ``(..., T, udim)`` tensor (None-safe)."""
+
+    return None if u is None else u[..., t, :]
+
+
 # ---------------------------------------------------------------------------
-# Predict primitives (one per algorithm family)
+# Predict primitives (one per approximation family)
 # ---------------------------------------------------------------------------
 
 class FilterPredict(ABC):
@@ -50,7 +83,6 @@ class FilterPredict(ABC):
     optionally returns the input-output cross-covariance needed by the update.
     """
 
-    @abstractmethod
     def __call__(
         self,
         model: Model,
@@ -58,20 +90,13 @@ class FilterPredict(ABC):
         u: Tensor = None,
         crossCov: bool = False
     ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-        pass
+        raise NotImplementedError
 
 
 class KalmanPredict(FilterPredict):
     """Closed-form linear-Gaussian predict (used by KalmanFilter)."""
 
-    def __call__(
-        self,
-        model: LinearGaussianModel,
-        dist: FilteringDistribution,
-        u: Tensor = None,
-        crossCov: bool = False
-    ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-        
+    def __call__(self, model, dist, u=None, crossCov=False):
         return F.kf_predict(model, dist, u, crossCov)
 
 
@@ -81,107 +106,60 @@ class SquareRootKalmanPredict(FilterPredict):
     factor of the covariance via QR of ``[A L_x | L_Q]`` (Park & Kailath).
     """
 
-    def __call__(
-        self,
-        model: LinearGaussianModel,
-        dist: FilteringDistribution,
-        u: Tensor = None,
-        crossCov: bool = False
-    ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
+    def __call__(self, model, dist, u=None, crossCov=False):
         return F.srkf_predict(model, dist, u, crossCov)
 
 
 class EnsembleKalmanPredict(FilterPredict):
     """Ensemble Kalman predict: propagate particles + Gaussian noise."""
 
-    def __call__(
-        self,
-        model: Model,
-        dist: FilteringDistribution,
-        u: Tensor = None,
-        crossCov: bool = False
-    ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-        
+    def __call__(self, model, dist, u=None, crossCov=False):
         return F.enkf_predict(model, dist, u, crossCov)
 
 
-class UnscentedKalmanPredict(FilterPredict):
+class _QuadraturePredict(FilterPredict):
     """
-    Unscented transform predict.  If ``regenerate_points=True`` (default), the
-    sigma points are re-generated around the input distribution's (mean, cov)
-    every call; otherwise the previously propagated particles are re-used
-    (faster, slightly less accurate -- mirrors the previous behaviour as an
-    opt-in optimization).
+    Deterministic-quadrature predict.  If ``regenerate_points=True`` (default)
+    the points are re-formed around the input distribution's (mean, cov) on
+    every call; otherwise previously propagated points are re-used when
+    present (faster, less accurate).
     """
 
-    def __init__(
-        self,
-        lmbda: float = 1.0,
-        regenerate_points: bool = True,
-    ) -> None:
-        
-        super().__init__()
-        self.lmbda = lmbda
+    def __init__(self, regenerate_points: bool = True) -> None:
         self.regenerate_points = regenerate_points
 
-    def __call__(
-        self,
-        model: Model,
-        dist: FilteringDistribution,
-        u: Tensor = None,
-        crossCov: bool = False
-    ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-        
+    def form_points(self, dist: FilteringDistribution) -> None:
+        raise NotImplementedError
+
+    def __call__(self, model, dist, u=None, crossCov=False):
         if self.regenerate_points or dist.particles is None:
-            dist.form_ut_points(self.lmbda)
+            self.form_points(dist)
         return F.gaussian_quadrature(model, dist, u, crossCov)
 
 
-class GaussHermitePredict(FilterPredict):
+class UnscentedKalmanPredict(_QuadraturePredict):
+    """Unscented-transform predict (2n+1 sigma points)."""
+
+    def __init__(self, lmbda: float = 1.0, regenerate_points: bool = True) -> None:
+        super().__init__(regenerate_points)
+        self.lmbda = lmbda
+
+    def form_points(self, dist):
+        dist.form_ut_points(self.lmbda)
+
+
+class GaussHermitePredict(_QuadraturePredict):
     """Gauss-Hermite quadrature predict (tensor-product nodes)."""
 
-    def __init__(
-        self,
-        regenerate_points: bool = True,
-    ) -> None:
-        
-        super().__init__()
-        self.regenerate_points = regenerate_points
-
-    def __call__(
-        self,
-        model: Model,
-        dist: FilteringDistribution,
-        u: Tensor = None,
-        crossCov: bool = False
-    ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-        
-        if self.regenerate_points or dist.particles is None:
-            dist.form_gh_points()
-        return F.gaussian_quadrature(model, dist, u, crossCov)
+    def form_points(self, dist):
+        dist.form_gh_points()
 
 
-class CubatureKalmanPredict(FilterPredict):
+class CubatureKalmanPredict(_QuadraturePredict):
     """3rd-order spherical-cubature predict (Arasaratnam & Haykin, 2009)."""
 
-    def __init__(
-        self,
-        regenerate_points: bool = True,
-    ) -> None:
-        
-        super().__init__()
-        self.regenerate_points = regenerate_points
-
-    def __call__(
-        self,
-        model: Model,
-        dist: FilteringDistribution,
-        u: Tensor = None,
-        crossCov: bool = False
-    ) -> Tuple[FilteringDistribution, Tensor] | FilteringDistribution:
-        if self.regenerate_points or dist.particles is None:
-            dist.form_cubature_points()
-        return F.gaussian_quadrature(model, dist, u, crossCov)
+    def form_points(self, dist):
+        dist.form_cubature_points()
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +167,11 @@ class CubatureKalmanPredict(FilterPredict):
 # ---------------------------------------------------------------------------
 
 class FilterUpdate(ABC):
+    """
+    Condition the predicted state on ``y`` given the predicted observation
+    distribution ``dist_y`` and the state-observation cross-covariance ``U``.
+    """
 
-    @abstractmethod
     def __call__(
         self,
         y: Tensor,
@@ -199,72 +180,52 @@ class FilterUpdate(ABC):
         U: Tensor,
         Sinv: Tensor | None = None
     ) -> FilteringDistribution:
-        pass
+        raise NotImplementedError
 
 
 class KalmanUpdate(FilterUpdate):
+    """Gaussian conditioning ``m + K (y - mu_y)``, ``P - K U^T``."""
 
-    def __call__(
-        self,
-        y: Tensor,
-        dist_x: FilteringDistribution,
-        dist_y: FilteringDistribution,
-        U: Tensor,
-        Sinv: Tensor | None = None
-    ) -> FilteringDistribution:
-        
+    def __call__(self, y, dist_x, dist_y, U, Sinv=None):
         return F.kalman_update(y, dist_x, dist_y, U, Sinv)
 
 
-class GaussQuadKalmanUpdate(FilterUpdate):
+class GaussQuadKalmanUpdate(KalmanUpdate):
     """
-    Kalman update for deterministic-quadrature filters.  Clears the stale
-    particle support so the next predict regenerates fresh sigma / cubature
+    Kalman update for deterministic-quadrature filters.  The posterior carries
+    the quadrature weights but no points, so the next predict forms fresh
     points around the updated (mean, cov).
     """
 
-    def __call__(
-        self,
-        y: Tensor,
-        dist_x: FilteringDistribution,
-        dist_y: FilteringDistribution,
-        U: Tensor,
-        Sinv: Tensor | None = None
-    ) -> FilteringDistribution:
-        
-        dist_x.particles = None
-        return F.kalman_update(y, dist_x, dist_y, U, Sinv)
-
 
 class EnsembleKalmanUpdate(FilterUpdate):
+    """Stochastic (perturbed-observation) ensemble update."""
 
-    def __call__(
-        self,
-        y: Tensor,
-        dist_x: FilteringDistribution,
-        dist_y: FilteringDistribution,
-        U: Tensor,
-        Sinv: Tensor | None = None
-    ) -> FilteringDistribution:
-        
+    def __call__(self, y, dist_x, dist_y, U, Sinv=None):
         return F.enkf_update(y, dist_x, dist_y, U, Sinv)
 
 
 # ---------------------------------------------------------------------------
-# Base recursion shared by all Gaussian filters
+# Base recursion shared by all filters
 # ---------------------------------------------------------------------------
 
 class Filter(ABC):
     """
     A Filter is a (dynamics predict, observations predict, update) triple plus
-    a recursive `filter(...)` driver.  All concrete Gaussian filters share the
-    same predict/observe/update loop -- they differ only in which predict /
-    update primitives they wire up.
+    the recursive `filter(...)` driver.
 
-    The base recursion plumbs ``compute_log_prob`` and an optional ``params``
-    tensor through every concrete filter so the marginal-likelihood path is
-    uniform across Kalman / Unscented / Gauss-Hermite / Cubature / Ensemble.
+    Subclasses customize the recursion only through three hooks:
+
+    * `initialize(init_dist)` -- prepare the prior ``p(x_0)`` (e.g. attach
+      quadrature weights or draw particles)
+    * `predict_step(dist, u)` -- ``p(x_{k-1} | ...) -> p(x_k | ...)`` through
+      the dynamics model
+    * `update_step(y, dist, u, compute_log_prob)` -- through the observation
+      model, returning the posterior and ``log p(y_k | y_{1:k-1})``
     """
+
+    #: Whether the filter supports a leading batch of trajectories in ``Data``.
+    supports_batch: bool = True
 
     def __init__(
         self,
@@ -273,11 +234,53 @@ class Filter(ABC):
         observations_filter: FilterPredict | None = None,
         update: FilterUpdate | None = None
     ) -> None:
-        
+
         self.model = model
         self.dynamics_filter = dynamics_filter
         self.observations_filter = observations_filter
         self.update = update
+
+    # -- model halves -----------------------------------------------------
+
+    @property
+    def dynamics(self) -> Model:
+        return self.model.dynamics
+
+    @property
+    def observations(self) -> Model:
+        return self.model.observations
+
+    # -- hooks ------------------------------------------------------------
+
+    def initialize(
+        self,
+        init_dist: FilteringDistribution
+    ) -> FilteringDistribution:
+        """Return a private copy of the prior so the caller's object is untouched."""
+
+        return init_dist.snapshot()
+
+    def predict_step(
+        self,
+        dist: FilteringDistribution,
+        u: Tensor | None = None
+    ) -> FilteringDistribution:
+
+        return self.dynamics_filter(model=self.dynamics, dist=dist, u=u, crossCov=False)
+
+    def update_step(
+        self,
+        y: Tensor,
+        dist: FilteringDistribution,
+        u: Tensor | None = None,
+        compute_log_prob: bool = False
+    ) -> Tuple[FilteringDistribution, Tensor | None]:
+
+        y_dist, U = self.observations_filter(model=self.observations, dist=dist, u=u, crossCov=True)
+        log_lik = y_dist.log_prob(y) if compute_log_prob else None
+        return self.update(y, dist, y_dist, U), log_lik
+
+    # -- recursion --------------------------------------------------------
 
     def filter(
         self,
@@ -287,64 +290,58 @@ class Filter(ABC):
         return_history: bool = False,
         compute_log_prob: bool = False,
         params: Tensor | None = None,
-    ) -> FilteringDistribution | List[FilteringDistribution]:
-        
+    ) -> FilteringDistribution | List[FilteringDistribution] | Tuple:
+        """
+        Run the filter over ``data``.
+
+        Parameters
+        ----------
+        data : Data
+            Observations ``y`` with shape ``(T, ydim)`` or ``(B, T, ydim)`` for a
+            batch of independent, equal-length trajectories (optional inputs
+            ``u`` with matching leading shape).
+        init_dist : FilteringDistribution
+            Prior ``p(x_0)``; shared by every trajectory in a batch.
+        y0 : bool
+            Whether the first data row observes ``x_0`` (see module docstring).
+        return_history : bool
+            Return the list ``[p(x_k | y_{...k})]_k`` instead of the final
+            distribution only.
+        compute_log_prob : bool
+            Also return ``log p(y_{1:n} | theta)`` (one value per trajectory).
+        params : Tensor, optional
+            Flat parameter vector forwarded to ``model.update`` first.
+        """
+
+        if data.y.ndim > 2 and not self.supports_batch:
+            raise NotImplementedError(f"{type(self).__name__} does not support batched trajectories.")
+
         if params is not None:
             self.model.update(params)
-        
-        T = len(data)
-        # Deepcopy init_dist so that updates to self.dist (mean/cov in-place via
-        # the kalman_update setter path) do not mutate the user's init_dist.
-        self.dist = copy.deepcopy(init_dist)
 
-        if return_history:
-            state_estimates = [copy.deepcopy(self.dist)]
+        dist = self.initialize(init_dist)
+        history = [] if return_history else None
+        log_prob = 0.0
 
-        if compute_log_prob:
-            log_prob = 0.0
-        
-        if y0:
-            t = 0
-            y_dist, U = self.observations_filter(
-                model=self.model.observations,
-                dist=self.dist,
-                u=data.u[t] if data.u is not None else None,
-                crossCov=True
+        if return_history and not y0:
+            history.append(dist.snapshot())
+
+        for t in range(len(data)):
+            if t > 0 or not y0:
+                dist = self.predict_step(dist, u=_input_at(data.u, t - 1 if y0 else t))
+
+            dist, log_lik = self.update_step(
+                data.y[..., t, :], dist, u=_input_at(data.u, t), compute_log_prob=compute_log_prob,
             )
-            
             if compute_log_prob:
-                log_prob = log_prob + y_dist.log_prob(data.y[t])
-
-            self.dist = self.update(data.y[t], self.dist, y_dist, U)
-
+                log_prob = log_prob + log_lik
             if return_history:
-                state_estimates.append(copy.deepcopy(self.dist))
+                history.append(dist.snapshot())
 
-        for t in range(1 if y0 else 0, T):
-            self.dist = self.dynamics_filter(
-                model=self.model.dynamics,
-                dist=self.dist,
-                u=data.u[t-1] if data.u is not None else None,
-                crossCov=False
-            )
-
-            y_dist, U = self.observations_filter(
-                model=self.model.observations,
-                dist=self.dist,
-                u=data.u[t] if data.u is not None else None,
-                crossCov=True
-            )
-
-            if compute_log_prob:
-                log_prob = log_prob + y_dist.log_prob(data.y[t])
-
-            self.dist = self.update(data.y[t], self.dist, y_dist, U)
-            if return_history:
-                state_estimates.append(copy.deepcopy(self.dist))
-
-        output = state_estimates if return_history else self.dist
+        self.dist = dist
+        output = history if return_history else dist
         return (output, log_prob) if compute_log_prob else output
-    
+
     def nlog_marginal_likelihood(
         self,
         data: Data,
@@ -352,8 +349,12 @@ class Filter(ABC):
         y0: bool = False,
         params: Tensor | None = None
     ) -> Tensor:
-        
-        _, logprob = self.filter(
+        """
+        ``-log p(y | theta)`` as a scalar.  For a batch of independent
+        trajectories the per-trajectory terms are summed.
+        """
+
+        _, log_prob = self.filter(
             data=data,
             init_dist=init_dist,
             y0=y0,
@@ -362,27 +363,49 @@ class Filter(ABC):
             params=params,
         )
 
-        return -logprob
+        return -torch.as_tensor(log_prob).sum()
+
+
+class _LinearGaussianObservations:
+    """
+    Mixin: expose the observation model as a `LinearGaussianModel`, wrapping a
+    noiseless `LinearModel` (e.g. `IdentityModel`) on the fly.  The user's
+    `SSM` is never modified.
+    """
+
+    _obs_source = None
+    _obs_wrapped = None
+
+    @property
+    def observations(self) -> LinearGaussianModel:
+        obs = self.model.observations
+        if obs is not self._obs_source:
+            self._obs_source = obs
+            self._obs_wrapped = _ensure_linear_gaussian(obs, self.model.ydim)
+        return self._obs_wrapped
+
+
+def _require_linear_gaussian_dynamics(model: SSM, name: str) -> None:
+    if not isinstance(model.dynamics, LinearGaussianModel):
+        raise ValueError(
+            f"{name} requires a linear-Gaussian dynamics model, got {type(model.dynamics)}."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Concrete Gaussian filters
 # ---------------------------------------------------------------------------
 
-class KalmanFilter(Filter):
+class KalmanFilter(_LinearGaussianObservations, Filter):
     """Standard linear-Gaussian Kalman filter."""
 
     def __init__(
         self,
         model: SSM
     ) -> None:
-        
-        if not isinstance(model.dynamics, LinearGaussianModel):
-            raise ValueError(
-                f"Kalman filter requires a linear-Gaussian dynamics model, got {type(model.dynamics)}."
-            )
-        # Accept IdentityModel/LinearModel observations by wrapping with epsilon noise.
-        model.observations = _ensure_linear_gaussian(model.observations, model.ydim)
+
+        _require_linear_gaussian_dynamics(model, "KalmanFilter")
+        _ensure_linear_gaussian(model.observations, model.ydim)  # validate early
 
         super().__init__(
             model=model,
@@ -392,12 +415,13 @@ class KalmanFilter(Filter):
         )
 
 
-class SquareRootKalmanFilter(Filter):
+class SquareRootKalmanFilter(_LinearGaussianObservations, Filter):
     """
-    Square-root Kalman filter.  Same fixed-point as the standard KF but never
-    materializes the dense covariance: predict and update operate on the
-    Cholesky factor through QR factorizations.  Recommended when the state
-    covariance is ill-conditioned.
+    Square-root Kalman filter.  Same fixed point as the standard KF but never
+    materializes a dense covariance: predict and update operate on Cholesky
+    factors through QR factorizations, and the marginal-likelihood term is
+    read off the innovation factor.  Recommended when the state covariance is
+    ill-conditioned.
     """
 
     def __init__(
@@ -405,77 +429,21 @@ class SquareRootKalmanFilter(Filter):
         model: SSM
     ) -> None:
 
-        if not isinstance(model.dynamics, LinearGaussianModel):
-            raise ValueError(
-                f"SquareRootKalmanFilter requires a linear-Gaussian dynamics model, got {type(model.dynamics)}."
-            )
-        model.observations = _ensure_linear_gaussian(model.observations, model.ydim)
+        _require_linear_gaussian_dynamics(model, "SquareRootKalmanFilter")
+        _ensure_linear_gaussian(model.observations, model.ydim)
 
         super().__init__(
             model=model,
             dynamics_filter=SquareRootKalmanPredict(),
-            observations_filter=None,  # update fuses predict+update for the obs step
-            update=None,
         )
 
-    def filter(
-        self,
-        data: Data,
-        init_dist: FilteringDistribution,
-        y0: bool = False,
-        return_history: bool = False,
-        compute_log_prob: bool = False,
-        params: Tensor | None = None,
-    ) -> FilteringDistribution | List[FilteringDistribution]:
-        """
-        Custom recursion that pairs the square-root predict with the square-root
-        update (the latter folds the observation prediction into a single QR).
-        """
-
-        if params is not None:
-            self.model.update(params)
-
-        T = len(data)
-        self.dist = copy.deepcopy(init_dist)
-        if return_history:
-            state_estimates = [copy.deepcopy(self.dist)]
-
-        if compute_log_prob:
-            log_prob = 0.0
-
-        if y0:
-            t = 0
-            u_t = data.u[t] if data.u is not None else None
-            if compute_log_prob:
-                y_dist = F.kf_predict(self.model.observations, self.dist, u=u_t, crossCov=False)
-                log_prob = log_prob + y_dist.log_prob(data.y[t])
-            self.dist = F.srkf_update(data.y[t], self.dist, self.model.observations, u=u_t)
-            if return_history:
-                state_estimates.append(copy.deepcopy(self.dist))
-
-        for t in range(1 if y0 else 0, T):
-            self.dist = self.dynamics_filter(
-                model=self.model.dynamics,
-                dist=self.dist,
-                u=data.u[t-1] if data.u is not None else None,
-                crossCov=False,
-            )
-
-            u_t = data.u[t] if data.u is not None else None
-            if compute_log_prob:
-                # For the log-likelihood we need the *predicted* observation Gaussian.
-                y_dist = F.kf_predict(self.model.observations, self.dist, u=u_t, crossCov=False)
-                log_prob = log_prob + y_dist.log_prob(data.y[t])
-
-            self.dist = F.srkf_update(data.y[t], self.dist, self.model.observations, u=u_t)
-            if return_history:
-                state_estimates.append(copy.deepcopy(self.dist))
-
-        output = state_estimates if return_history else self.dist
-        return (output, log_prob) if compute_log_prob else output
+    def update_step(self, y, dist, u=None, compute_log_prob=False):
+        # Observation predict and update are fused into a single QR.
+        return F.srkf_update(y, dist, self.observations, u=u, compute_log_prob=compute_log_prob)
 
 
 class UnscentedKalmanFilter(Filter):
+    """Unscented Kalman filter (Julier & Uhlmann; Wan & van der Merwe weights)."""
 
     def __init__(
         self,
@@ -485,42 +453,27 @@ class UnscentedKalmanFilter(Filter):
         kappa: float = 0.0,
         regenerate_points: bool = True,
     ) -> None:
-        
+
         self.alpha = alpha
         self.beta = beta
         self.kappa = kappa
-        lmbda = alpha**2 * (model.xdim + kappa) - model.xdim
-        self.lmbda = lmbda
+        self.lmbda = alpha**2 * (model.xdim + kappa) - model.xdim
 
         super().__init__(
             model=model,
-            dynamics_filter=UnscentedKalmanPredict(lmbda, regenerate_points=regenerate_points),
-            observations_filter=UnscentedKalmanPredict(lmbda, regenerate_points=regenerate_points),
+            dynamics_filter=UnscentedKalmanPredict(self.lmbda, regenerate_points=regenerate_points),
+            observations_filter=UnscentedKalmanPredict(self.lmbda, regenerate_points=regenerate_points),
             update=GaussQuadKalmanUpdate(),
         )
 
-    def filter(
-        self,
-        data: Data,
-        init_dist: FilteringDistribution,
-        y0: bool = False,
-        return_history: bool = False,
-        compute_log_prob: bool = False,
-        params: Tensor | None = None,
-    ) -> FilteringDistribution | List[FilteringDistribution]:
-    
-        init_dist = copy.copy(init_dist)
-        init_dist.form_ut_weights(
-            alpha=self.alpha,
-            beta=self.beta,
-            kappa=self.kappa,
-            lmbda=self.lmbda,
-        )
-
-        return super().filter(data, init_dist, y0, return_history, compute_log_prob, params)
+    def initialize(self, init_dist):
+        dist = super().initialize(init_dist)
+        dist.form_ut_weights(alpha=self.alpha, beta=self.beta, kappa=self.kappa, lmbda=self.lmbda)
+        return dist
 
 
 class GaussHermiteFilter(Filter):
+    """Gauss-Hermite Kalman filter with tensor-product nodes of the given order."""
 
     def __init__(
         self,
@@ -528,7 +481,7 @@ class GaussHermiteFilter(Filter):
         order: int = 3,
         regenerate_points: bool = True,
     ) -> None:
-        
+
         self.order = order
 
         super().__init__(
@@ -538,20 +491,10 @@ class GaussHermiteFilter(Filter):
             update=GaussQuadKalmanUpdate(),
         )
 
-    def filter(
-        self,
-        data: Data,
-        init_dist: FilteringDistribution,
-        y0: bool = False,
-        return_history: bool = False,
-        compute_log_prob: bool = False,
-        params: Tensor | None = None,
-    ) -> FilteringDistribution | List[FilteringDistribution]:
-
-        init_dist = copy.copy(init_dist)
-        init_dist.form_gh_weights(order=self.order)
-
-        return super().filter(data, init_dist, y0, return_history, compute_log_prob, params)
+    def initialize(self, init_dist):
+        dist = super().initialize(init_dist)
+        dist.form_gh_weights(order=self.order)
+        return dist
 
 
 class CubatureKalmanFilter(Filter):
@@ -566,7 +509,7 @@ class CubatureKalmanFilter(Filter):
         model: SSM,
         regenerate_points: bool = True,
     ) -> None:
-        
+
         super().__init__(
             model=model,
             dynamics_filter=CubatureKalmanPredict(regenerate_points=regenerate_points),
@@ -574,32 +517,25 @@ class CubatureKalmanFilter(Filter):
             update=GaussQuadKalmanUpdate(),
         )
 
-    def filter(
-        self,
-        data: Data,
-        init_dist: FilteringDistribution,
-        y0: bool = False,
-        return_history: bool = False,
-        compute_log_prob: bool = False,
-        params: Tensor | None = None,
-    ) -> FilteringDistribution | List[FilteringDistribution]:
-
-        init_dist = copy.copy(init_dist)
-        init_dist.form_cubature_weights()
-
-        return super().filter(data, init_dist, y0, return_history, compute_log_prob, params)
+    def initialize(self, init_dist):
+        dist = super().initialize(init_dist)
+        dist.form_cubature_weights()
+        return dist
 
 
 class EnsembleKalmanFilter(Filter):
+    """Stochastic ensemble Kalman filter (single trajectory)."""
+
+    supports_batch = False
 
     def __init__(
         self,
         model: SSM,
         ensemble_size: int
     ) -> None:
-        
+
         self.ensemble_size = ensemble_size
-        
+
         super().__init__(
             model=model,
             dynamics_filter=EnsembleKalmanPredict(),
@@ -607,42 +543,29 @@ class EnsembleKalmanFilter(Filter):
             update=EnsembleKalmanUpdate(),
         )
 
-    def filter(
-        self,
-        data: Data,
-        init_dist: FilteringDistribution,
-        y0: bool = False,
-        return_history: bool = False,
-        compute_log_prob: bool = False,
-        params: Tensor | None = None,
-    ) -> FilteringDistribution | List[FilteringDistribution]:
-    
-        init_dist = copy.copy(init_dist)
-        init_dist.sample_particles(self.ensemble_size)
-
-        return super().filter(
-            data=data,
-            init_dist=init_dist,
-            y0=y0,
-            return_history=return_history,
-            compute_log_prob=compute_log_prob,
-            params=params,
-        )
+    def initialize(self, init_dist):
+        dist = super().initialize(init_dist)
+        dist.sample_particles(self.ensemble_size)
+        return dist
 
 
 # ---------------------------------------------------------------------------
 # Particle filter (bootstrap with optional ESS-based resampling)
 # ---------------------------------------------------------------------------
 
-class ParticleFilter:
+class ParticleFilter(Filter):
     """
     Bootstrap particle filter with effective-sample-size triggered resampling.
 
-    The observation model must be an `AdditiveModel` (we use its Cholesky factor
-    to evaluate ``log p(y | x_i)`` without forming the inverse).  Dynamics can
-    be any `Model` -- they are propagated via ``model.sample`` so arbitrary
-    non-Gaussian process noise is supported.
+    Predict samples each particle through the dynamics model (``model.sample``),
+    so arbitrary non-Gaussian process noise is supported.  Update weights the
+    particles by ``log p(y | x_i)``, which needs an additive-Gaussian
+    observation model; the log-sum-exp of the weights is the
+    marginal-likelihood term (unbiased in ``p(y | theta)``, which is what
+    pseudo-marginal MCMC requires).
     """
+
+    supports_batch = False
 
     def __init__(
         self,
@@ -651,84 +574,30 @@ class ParticleFilter:
         resample_method: str = 'systematic',
         ess_threshold: float = 0.5,
     ) -> None:
-        
+
         if not isinstance(model.observations, AdditiveModel):
             raise ValueError(
                 "ParticleFilter requires an additive-Gaussian observation model so the "
                 "per-particle likelihood log p(y|x) is tractable."
             )
 
-        self.model = model
+        super().__init__(model=model)
         self.n_particles = n_particles
         self.resample_method = resample_method
         self.ess_threshold = ess_threshold
 
-    def filter(
-        self,
-        data: Data,
-        init_dist: FilteringDistribution,
-        y0: bool = False,
-        return_history: bool = False,
-        compute_log_prob: bool = False,
-        params: Tensor | None = None,
-    ) -> FilteringDistribution | List[FilteringDistribution]:
-
-        if params is not None:
-            self.model.update(params)
-
-        T = len(data)
-        dist = copy.copy(init_dist)
+    def initialize(self, init_dist):
+        dist = super().initialize(init_dist)
         dist.sample_particles(self.n_particles)
+        return dist
 
-        if return_history:
-            history = [copy.deepcopy(dist)]
-        if compute_log_prob:
-            log_prob = 0.0
+    def predict_step(self, dist, u=None):
+        return F.bootstrap_pf_predict(self.dynamics, dist, u=u)
 
-        if y0:
-            t = 0
-            dist, lm = F.particle_filter_update(
-                data.y[t], dist, self.model.observations,
-                resample_threshold=self.ess_threshold,
-                resample_method=self.resample_method,
-            )
-            if compute_log_prob:
-                log_prob = log_prob + lm
-            if return_history:
-                history.append(copy.deepcopy(dist))
-
-        for t in range(1 if y0 else 0, T):
-            dist = F.bootstrap_pf_predict(
-                self.model.dynamics, dist,
-                u=data.u[t-1] if data.u is not None else None,
-            )
-            dist, lm = F.particle_filter_update(
-                data.y[t], dist, self.model.observations,
-                resample_threshold=self.ess_threshold,
-                resample_method=self.resample_method,
-            )
-            if compute_log_prob:
-                log_prob = log_prob + lm
-            if return_history:
-                history.append(copy.deepcopy(dist))
-
-        self.dist = dist
-        output = history if return_history else dist
-        return (output, log_prob) if compute_log_prob else output
-
-    def nlog_marginal_likelihood(
-        self,
-        data: Data,
-        init_dist: FilteringDistribution,
-        y0: bool = False,
-        params: Tensor | None = None,
-    ) -> Tensor:
-        _, logprob = self.filter(
-            data=data,
-            init_dist=init_dist,
-            y0=y0,
-            return_history=False,
-            compute_log_prob=True,
-            params=params,
+    def update_step(self, y, dist, u=None, compute_log_prob=False):
+        return F.particle_filter_update(
+            y, dist, self.observations,
+            resample_threshold=self.ess_threshold,
+            resample_method=self.resample_method,
+            u=u,
         )
-        return -logprob

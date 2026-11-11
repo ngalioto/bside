@@ -130,4 +130,6 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-"site/" 
+# Local work
+experiments/
+.claude/

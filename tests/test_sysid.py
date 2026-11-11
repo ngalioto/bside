@@ -101,9 +101,14 @@ def test_em_recovers_linear_gaussian_parameters():
     em = EM(ssm=fit_ssm, init_dist=init_dist, y0=True)
     log_marg = em.fit(data, n_iter=40, tol=1e-5)
 
-    A_hat = fit_ssm.dynamics.mat_x
-    err_init = (A_init - A_true).abs().max()
-    err_final = (A_hat - A_true).abs().max()
+    # With C also re-estimated, A is identifiable only up to a similarity
+    # transform, so compare its (similarity-invariant) eigenvalues.
+    def eigs(A):
+        e = torch.linalg.eigvals(A)
+        return e[torch.argsort(e.real)]
+
+    err_init = (eigs(A_init) - eigs(A_true)).abs().max()
+    err_final = (eigs(fit_ssm.dynamics.mat_x) - eigs(A_true)).abs().max()
     assert err_final < err_init  # EM moved A toward the truth
     # log-likelihood non-decreasing (monotone EM)
     diffs = log_marg[1:] - log_marg[:-1]

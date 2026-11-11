@@ -99,7 +99,7 @@ Users can construct `PSDMatrix(default_sqrt=..., sqrt_only=True)` when they only
 
 ### Adaptive Kalman gain (`kalman_gain`)
 
-Picks among `Sinv @ U`, `linalg.solve`, or two-stage `solve_triangular` depending on which factor is fresh. **All linear-Gaussian update paths must call this helper** — do not open-code a new gain computation in a new filter variant.
+Picks among `Sinv @ U`, `cholesky_solve` (when the Cholesky factor of `S` is cached, e.g. after the likelihood was evaluated), or `linalg.solve`. **All linear-Gaussian update paths must call this helper** — do not open-code a new gain computation in a new filter variant.
 
 ### Single `U = Σ Aᵀ` in `kf_predict`
 
@@ -123,11 +123,9 @@ Always delegates to `model.sample` — the old `LinearGaussianModel` branch with
 
 **Opt-in (`regenerate_points=False`):** Re-use propagated particles for the observation step (faster, slightly less accurate). Exposed on `UnscentedKalmanPredict`, `GaussHermitePredict`, `CubatureKalmanPredict`.
 
-### `Filter.filter` and `init_dist` copying
+### `Filter.filter`: one recursion, no mutation
 
-**Plan originally said shallow `copy.copy`.** We switched to **`copy.deepcopy(init_dist)`** because `kalman_update` mutates `dist.cov` in place via PSDMatrix setters; with `y0=True` and a shallow copy, the user's original `init_dist` was corrupted.
-
-History entries still use `deepcopy` per step. Only the working copy at the top of `filter()` needed the fix.
+Every filter runs the same loop over `predict_step` (dynamics) and `update_step` (observations, returning the likelihood term); subclasses only override those hooks. Primitives return new distributions instead of mutating their inputs, so the prior and history entries are stored with the cheap `FilteringDistribution.snapshot()` rather than `deepcopy`. State covariances use the plain `Covariance` cache, not the `PSDMatrix` module, which is reserved for (learnable) model covariances. `history[k]` is always `p(x_k | ...)` for either value of `y0`.
 
 ### Particle filter numerics
 
