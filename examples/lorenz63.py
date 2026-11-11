@@ -31,7 +31,7 @@ import torch
 import matplotlib.pyplot as plt
 
 import bside
-from mcmc_samplers import DelayedRejectionAdaptiveMetropolis
+from mcmc_samplers import DelayedRejectionAdaptiveMetropolis, SampleVisualizer
 
 torch.manual_seed(0)
 
@@ -122,28 +122,43 @@ plt.show()
 # ## Likelihood from two filters
 #
 # Profile $\log p(y \mid \theta)$ over $\theta_2$ ($\rho$), with the other
-# parameters at their true values and a small process noise. The UKF gives a
-# smooth deterministic approximation. The particle filter gives a noisy but
-# unbiased estimate.
+# dynamics parameters at their true values. Each curve uses a different
+# process-noise level. The UKF gives a smooth deterministic approximation; the
+# particle filter gives a noisy but unbiased estimate.
+#
+# The process noise controls how forgiving the likelihood is. With little noise
+# the filter must follow the chaotic dynamics closely, so the curve is sharply
+# peaked and drops steeply away from the truth. With more noise the filter
+# corrects the trajectory at every measurement, and the curve flattens.
 
 # %%
 pf = bside.ParticleFilter(model, n_particles=500)
-base = torch.cat([theta_dyn_true, torch.full((3,), math.log(0.3)), torch.tensor([math.log(2.0)])])
-rhos = torch.linspace(24.0, 32.0, 17)
-grid = base.repeat(len(rhos), 1)
-grid[:, 1] = rhos
+rhos = torch.linspace(22.0, 34.0, 25)
+noise_sds = [0.1, 0.3, 1.0, 3.0]
+colors = plt.cm.viridis(torch.linspace(0.0, 0.85, len(noise_sds)).numpy())
+
+grid = torch.cat([theta_dyn_true, torch.zeros(3), torch.tensor([math.log(2.0)])]).repeat(len(noise_sds), len(rhos), 1)
+grid[..., 1] = rhos
+grid[..., 3:6] = torch.log(torch.tensor(noise_sds))[:, None, None]
 
 with torch.no_grad():
-    ll_ukf = posterior.log_likelihood(grid)                          # one batched UKF pass
-    ll_pf = torch.stack([-pf.nlog_marginal_likelihood(data, init_dist, params=theta) for theta in grid])
+    ll_ukf = posterior.log_likelihood(grid)                          # all levels x rhos in one batched UKF pass
+    ll_pf = torch.stack([torch.stack([-pf.nlog_marginal_likelihood(data, init_dist, params=theta) for theta in row])
+                         for row in grid])
 
-plt.figure(figsize=(6, 3.5))
-plt.plot(rhos, ll_ukf, 'C0-', label='unscented Kalman filter')
-plt.plot(rhos, ll_pf, 'C3o', ms=4, label='particle filter (500 particles)')
-plt.axvline(28.0, color='k', ls='--', lw=1, label='true value')
-plt.xlabel('theta_2 (rho)')
-plt.ylabel('log p(y | theta)')
-plt.legend()
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+for ax, ll, title in [(axes[0], ll_ukf, 'unscented Kalman filter'), (axes[1], ll_pf, 'particle filter (500 particles)')]:
+    for sd, curve, color in zip(noise_sds, ll, colors):
+        style = '-' if ax is axes[0] else 'o-'
+        ax.plot(rhos, curve, style, color=color, ms=3, lw=1.5 if ax is axes[0] else 0.8, label=f'process sd {sd:g}')
+    ax.axvline(28.0, color='k', ls='--', lw=1)
+    ax.set_title(title)
+    ax.set_xlabel('theta_2 (rho)')
+axes[0].set_ylabel('log p(y | theta)')
+top = max(ll_ukf.max(), ll_pf.max()).item()
+axes[0].set_ylim(top - 400, top + 20)
+axes[0].legend(fontsize=8)
+fig.tight_layout()
 plt.show()
 
 # %% [markdown]
@@ -211,25 +226,73 @@ plt.show()
 # %% [markdown]
 # ## Posterior sampling with DRAM
 #
-# Start DRAM at the continuation estimate.
+# Start DRAM at the continuation estimate, with its proposal shaped by the
+# Laplace covariance there (the inverse Hessian of the log posterior, from
+# autograd through the UKF); DRAM scales it by $2.4^2/d$. DRAM's reported
+# acceptance also counts its small second-stage retries after a rejection, so
+# the first-stage rate is measured separately: each iteration evaluates the
+# target once, plus once more per first-stage rejection.
 
 # %%
-dram = DelayedRejectionAdaptiveMetropolis(target=posterior, x0=theta_hat, cov=1e-3 * torch.eye(7))
+class CountCalls:
+    def __init__(self, f):
+        self.f, self.calls = f, 0
+
+    def __call__(self, theta):
+        self.calls += 1
+        return self.f(theta)
+
+
+n_dram, burn = 2000, 400
+counted = CountCalls(posterior)
+dram = DelayedRejectionAdaptiveMetropolis(target=counted, x0=theta_hat, cov=bside.laplace_covariance(posterior, theta_hat))
+counted.calls = 0
 with torch.no_grad():
-    samples, _ = dram(1500)
-samples = samples[300:]
+    chain, _ = dram(n_dram)
+samples = chain[burn:]
+first_stage = 1 - (counted.calls - n_dram) / n_dram
 
 names = ['theta_1', 'theta_2', 'theta_3', 'log s_1', 'log s_2', 'log s_3', 'log s_eta']
 truth = [10.0, 28.0, 8.0 / 3.0, None, None, None, math.log(2.0)]
-print(f'acceptance rate: {100 * dram.acceptance_ratio:.1f}%')
-fig, axes = plt.subplots(1, 7, figsize=(16, 2.6))
-for i, ax in enumerate(axes):
-    ax.hist(samples[:, i], bins=30, density=True, color='C0', alpha=0.7)
-    if truth[i] is not None:
-        ax.axvline(truth[i], color='k', lw=1)
-    ax.set_title(names[i], fontsize=9)
-    print(f'{names[i]:>9}: {samples[:, i].mean():7.3f} +/- {samples[:, i].std():.3f}' +
+ess = bside.effective_sample_size(samples)
+print(f'first-stage acceptance {100 * first_stage:.0f}%, overall {100 * dram.acceptance_ratio:.0f}%, '
+      f'{len(samples)} draws after burn-in')
+for i, name in enumerate(names):
+    print(f'{name:>9}: {samples[:, i].mean():7.3f} +/- {samples[:, i].std():.3f}   ESS {ess[i]:4.0f}' +
           ('' if truth[i] is None else f'   (true {truth[i]:.3f})'))
+
+# %% [markdown]
+# Diagnostics: trace plots (no trends or long flat stretches) and
+# autocorrelations (quick decay) indicate good mixing.
+
+# %%
+acf = bside.autocorrelation(samples, max_lag=100)
+fig, axes = plt.subplots(2, 7, figsize=(17, 4.5))
+for i in range(7):
+    axes[0, i].plot(samples[:, i], color='C0', lw=0.4)
+    axes[0, i].set_title(names[i], fontsize=9)
+    axes[1, i].plot(acf[:, i], color='C0')
+    axes[1, i].axhline(0, color='gray', lw=0.5)
+    axes[1, i].set_xlabel('lag')
+axes[0, 0].set_ylabel('trace')
+axes[1, 0].set_ylabel('autocorrelation')
+fig.tight_layout()
+plt.show()
+
+# %% [markdown]
+# Marginal (diagonal) and pairwise (lower triangle) posterior histograms, with
+# the true values in black where they exist. The correlations show which
+# parameters the data can only pin down jointly.
+
+# %%
+(fig,), (axs,) = SampleVisualizer(samples).triangular_hist(bins=30, labels=names)
+for row in range(7):
+    for col in range(row + 1):
+        if truth[col] is not None:
+            axs[row, col].axvline(truth[col], color='k', lw=0.8)
+        if row != col and truth[row] is not None:
+            axs[row, col].axhline(truth[row], color='k', lw=0.8)
+fig.set_size_inches(11, 11)
 fig.tight_layout()
 plt.show()
 
@@ -250,8 +313,8 @@ with torch.no_grad():
     learned_long = learned.predict(x0, T=T_long)
 
 t_long = torch.arange(1, T_long + 1) * DT
-fig = plt.figure(figsize=(12, 3.5))
-ax = fig.add_subplot(1, 3, (1, 2))
+fig = plt.figure(figsize=(14, 3.6))
+ax = fig.add_subplot(1, 4, (1, 2))
 window = t_long <= 20
 ax.plot(t_long[window], true_long[window, 0], 'k', lw=1, label='truth')
 ax.plot(t_long[window], learned_long[window, 0], 'C1', lw=1, label='learned model')
@@ -259,13 +322,15 @@ ax.plot(t, y[:, 0], '.', color='C0', ms=4, label='data')
 ax.axvline(n * DT, color='gray', ls='--', lw=1)
 ax.set_xlabel('time')
 ax.set_ylabel('x')
-ax.legend(fontsize=8)
-ax = fig.add_subplot(1, 3, 3)
-ax.plot(true_long[:, 0], true_long[:, 2], 'k', lw=0.3, alpha=0.7, label='truth')
-ax.plot(learned_long[:, 0], learned_long[:, 2], 'C1', lw=0.3, alpha=0.7, label='learned')
-ax.set_xlabel('x')
-ax.set_ylabel('z')
-ax.set_title('attractor over 200 s')
-ax.legend(fontsize=8)
+ax.legend(fontsize=8, loc='upper right')
+for k, (traj, color, title) in enumerate([(true_long, 'k', 'truth over 200 s, with data'),
+                                          (learned_long, 'C1', 'learned model over 200 s')]):
+    ax = fig.add_subplot(1, 4, 3 + k, sharex=ax if k else None, sharey=ax if k else None)
+    ax.plot(traj[:, 0], traj[:, 2], color=color, lw=0.3, alpha=0.6)
+    if k == 0:
+        ax.plot(y[:, 0], y[:, 2], '.', color='C0', ms=4)
+    ax.set_xlabel('x')
+    ax.set_ylabel('z')
+    ax.set_title(title, fontsize=10)
 fig.tight_layout()
 plt.show()

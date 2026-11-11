@@ -256,3 +256,76 @@ class HMC:
         self.step_size = eps
         self.acceptance_rate = torch.stack(accepts).mean().item() if accepts else float('nan')
         return torch.stack(samples), torch.stack(log_probs)
+
+
+# ---------------------------------------------------------------------------
+# Proposal tuning and sampler diagnostics
+# ---------------------------------------------------------------------------
+
+def laplace_covariance(
+    target: Target,
+    theta: Tensor,
+    rel_floor: float = 1e-8,
+) -> Tensor:
+    """
+    Covariance of the Laplace (Gaussian) approximation at a mode ``theta``:
+    the inverse of the negative Hessian of ``target`` (computed by autograd
+    through the filter).  Eigenvalues of the negative Hessian are floored at
+    ``rel_floor`` times the largest one, so the result is positive definite
+    even slightly away from the mode.
+
+    Scaled by ``2.38**2 / p``, it is the standard random-walk Metropolis proposal
+    covariance for a ``p``-dimensional posterior.
+    """
+
+    with torch.enable_grad():
+        H = torch.autograd.functional.hessian(lambda x: target(x).sum(), theta.detach())
+    neg_H = -0.5 * (H + H.mT)
+    evals, evecs = torch.linalg.eigh(neg_H)
+    evals = evals.clamp(min=rel_floor * evals.abs().max())
+    return (evecs / evals) @ evecs.mT
+
+
+def autocorrelation(
+    samples: Tensor,
+    max_lag: int | None = None,
+) -> Tensor:
+    """
+    Normalized autocorrelation of each parameter of a chain ``(n, p)`` (or of
+    several chains ``(n, C, p)``, averaged over chains), up to ``max_lag``.
+    Returns ``(max_lag + 1, p)``.
+    """
+
+    x = samples - samples.mean(0)
+    n = x.shape[0]
+    max_lag = n - 1 if max_lag is None else min(max_lag, n - 1)
+    f = torch.fft.rfft(x, n=2 * n, dim=0)
+    acov = torch.fft.irfft(f * f.conj(), n=2 * n, dim=0)[: max_lag + 1] / n
+    acf = acov / acov[:1]
+    return acf.mean(1) if acf.ndim == 3 else acf
+
+
+def effective_sample_size(
+    samples: Tensor,
+) -> Tensor:
+    """
+    Effective sample size of each parameter, ``n / tau`` with the integrated
+    autocorrelation time ``tau`` from Geyer's initial positive sequence.  For
+    several chains ``(n, C, p)`` the per-chain values are summed.
+    """
+
+    if samples.ndim == 3:
+        return torch.stack([effective_sample_size(samples[:, c]) for c in range(samples.shape[1])]).sum(0)
+
+    n = samples.shape[0]
+    acf = autocorrelation(samples)
+    ess = []
+    for rho in acf.T:
+        tau = -1.0
+        for m in range(0, n - 1, 2):
+            pair = rho[m] + rho[m + 1]
+            if pair <= 0:
+                break
+            tau += 2 * pair.item()
+        ess.append(n / max(tau, 1.0 / n))
+    return torch.tensor(ess)

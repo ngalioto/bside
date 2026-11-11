@@ -124,7 +124,8 @@ class Posterior:
         """
         ``log p(theta) + log p(y | theta)`` for ``params`` of shape ``(..., p)``.
         Where the prior is zero the filter is not run (the model may be invalid
-        there) and ``-inf`` is returned.  Differentiable for the Gaussian filters.
+        there), and where the filter fails numerically, ``-inf`` is returned.
+        Differentiable for the Gaussian filters.
         """
 
         log_prior = self.log_prior(params)
@@ -135,8 +136,27 @@ class Posterior:
             # Evaluate invalid rows at a valid point, then mask them out.
             fill = params[valid][0]
             params = torch.where(valid.unsqueeze(-1), params, fill.detach())
-        log_post = self.log_likelihood(params) + log_prior
+        log_post = self._safe_log_likelihood(params) + log_prior
+        log_post = torch.where(torch.isnan(log_post), float('-inf'), log_post)
         return torch.where(valid, log_post, log_prior)
+
+    def _safe_log_likelihood(
+        self,
+        params: Tensor,
+    ) -> Tensor:
+        """
+        `log_likelihood`, but a parameter value for which the filter fails
+        numerically (e.g. a non-positive-definite covariance from an unstable
+        proposal) gets ``-inf`` instead of raising, so samplers simply reject it.
+        """
+
+        try:
+            return self.log_likelihood(params)
+        except (torch.linalg.LinAlgError, ValueError, RuntimeError):
+            if params.ndim == 1:
+                return torch.tensor(float('-inf'), dtype=params.dtype)
+            flat = params.reshape(-1, params.shape[-1])
+            return torch.stack([self._safe_log_likelihood(theta) for theta in flat]).reshape(params.shape[:-1])
 
     def log_prob_and_grad(
         self,

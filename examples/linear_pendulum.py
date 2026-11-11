@@ -127,39 +127,99 @@ plt.show()
 # ## Posterior sampling: DRAM and HMC
 #
 # Both samplers target the same posterior and start from the MAP estimate.
-# DRAM (delayed-rejection adaptive Metropolis) needs only the log density.
-# HMC also uses its gradient and runs several chains as one batch.
+#
+# **DRAM** (delayed-rejection adaptive Metropolis) needs only the log density.
+# A random walk mixes well only if its proposal matches the posterior's scales
+# and correlations. `laplace_covariance` provides them: the inverse Hessian of
+# the log posterior at the MAP, computed by autograd through the filter. DRAM
+# scales it by $2.4^2/d$, the standard choice, which gives the textbook
+# first-stage acceptance of about 25%. DRAM's reported acceptance also counts
+# its small second-stage retries after a rejection, so the first-stage rate is
+# measured separately here.
+#
+# **HMC** also uses the gradient and runs four chains as one batch.
 
 # %%
-dram = DelayedRejectionAdaptiveMetropolis(target=posterior, x0=best, cov=1e-3 * torch.eye(6))
+class CountCalls:
+    """Wraps the target to count evaluations: each DRAM iteration costs one, plus one per first-stage rejection."""
+    def __init__(self, f):
+        self.f, self.calls = f, 0
+
+    def __call__(self, theta):
+        self.calls += 1
+        return self.f(theta)
+
+
+n_dram, burn = 6000, 1000
+counted = CountCalls(posterior)
+dram = DelayedRejectionAdaptiveMetropolis(target=counted, x0=best, cov=bside.laplace_covariance(posterior, best))
+counted.calls = 0
 with torch.no_grad():
-    dram_samples, _ = dram(5000)
-dram_samples = dram_samples[1000:]
-print(f'DRAM acceptance rate: {100 * dram.acceptance_ratio:.1f}%')
+    dram_chain, _ = dram(n_dram)
+dram_samples = dram_chain[burn:]
+first_stage = 1 - (counted.calls - n_dram) / n_dram
+print(f'DRAM: first-stage acceptance {100 * first_stage:.0f}%, overall {100 * dram.acceptance_ratio:.0f}%')
 
 hmc = bside.HMC(posterior, n_leapfrog=12)
-hmc_samples, _ = hmc(best.expand(4, 6), n_samples=500, n_warmup=300)
-hmc_samples = hmc_samples.reshape(-1, 6)
-print(f'HMC acceptance rate: {100 * hmc.acceptance_rate:.1f}% (4 chains)')
+hmc_chains, _ = hmc(best.expand(4, 6), n_samples=750, n_warmup=300)   # (750, 4 chains, 6)
+hmc_samples = hmc_chains.reshape(-1, 6)
+print(f'HMC:  acceptance {100 * hmc.acceptance_rate:.0f}% (4 chains)')
 
-print(f'\n{"":>12} {"true":>8} {"DRAM":>18} {"HMC":>18}')
+ess_dram = bside.effective_sample_size(dram_samples)
+ess_hmc = bside.effective_sample_size(hmc_chains)
+print()
+print(f'{"":>12} {"true":>8} {"DRAM":>18} {"HMC":>18} {"ESS DRAM":>9} {"ESS HMC":>8}')
 for i, name in enumerate(param_names):
     d, h = dram_samples[:, i], hmc_samples[:, i]
-    print(f'{name:>12} {theta_true[i]:8.3f} {d.mean():8.3f} +/- {d.std():5.3f} {h.mean():8.3f} +/- {h.std():5.3f}')
+    print(f'{name:>12} {theta_true[i]:8.3f} {d.mean():8.3f} +/- {d.std():5.3f} {h.mean():8.3f} +/- {h.std():5.3f}'
+          f' {ess_dram[i]:9.0f} {ess_hmc[i]:8.0f}')
+print(f'draws: DRAM {len(dram_samples)}, HMC {len(hmc_samples)}')
+
+# %% [markdown]
+# Diagnostics: trace plots (DRAM, and one HMC chain), and the autocorrelation
+# of each parameter. Good mixing shows traces with no trends or long flat
+# stretches, and autocorrelations that decay quickly.
+
+# %%
+acf_dram = bside.autocorrelation(dram_samples, max_lag=100)
+acf_hmc = bside.autocorrelation(hmc_chains, max_lag=100)
+fig, axes = plt.subplots(3, 6, figsize=(16, 6.5))
+for i in range(6):
+    axes[0, i].plot(dram_samples[:, i], color='C0', lw=0.4)
+    axes[0, i].set_title(param_names[i], fontsize=9)
+    axes[1, i].plot(hmc_chains[:, 0, i], color='C2', lw=0.4)
+    axes[2, i].plot(acf_dram[:, i], color='C0', label='DRAM')
+    axes[2, i].plot(acf_hmc[:, i], color='C2', label='HMC')
+    axes[2, i].axhline(0, color='gray', lw=0.5)
+    axes[2, i].set_xlabel('lag')
+axes[0, 0].set_ylabel('DRAM trace')
+axes[1, 0].set_ylabel('HMC trace (chain 1)')
+axes[2, 0].set_ylabel('autocorrelation')
+axes[2, 0].legend(fontsize=8)
+fig.tight_layout()
+plt.show()
 
 # %%
 fig, axes = plt.subplots(1, 6, figsize=(15, 2.6))
 for i, ax in enumerate(axes):
-    ax.hist(dram_samples[:, i], bins=40, density=True, alpha=0.5, label='DRAM')
-    ax.hist(hmc_samples[:, i], bins=40, density=True, alpha=0.5, label='HMC')
-    if i < 4 or i == 5:
+    ax.hist(dram_samples[:, i], bins=40, density=True, alpha=0.5, color='C0', label='DRAM')
+    ax.hist(hmc_samples[:, i], bins=40, density=True, alpha=0.5, color='C2', label='HMC')
+    if i != 4:
         ax.axvline(theta_true[i], color='k', lw=1)
     ax.set_title(param_names[i], fontsize=9)
 axes[0].legend(fontsize=8)
 fig.tight_layout()
 plt.show()
 
-SampleVisualizer(hmc_samples[:, :4]).triangular_hist(bins=40)
+(fig,), (axs,) = SampleVisualizer(hmc_samples).triangular_hist(bins=40, labels=param_names)
+for row in range(6):
+    for col in range(row + 1):
+        if col != 4:
+            axs[row, col].axvline(theta_true[col], color='k', lw=0.8)
+        if row != col and row != 4:
+            axs[row, col].axhline(theta_true[row], color='k', lw=0.8)
+fig.set_size_inches(10, 10)
+fig.tight_layout()
 plt.show()
 
 # %% [markdown]

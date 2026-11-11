@@ -24,7 +24,8 @@ from bside.models import (
 )
 from bside.ssm import SSM
 from bside.subspace_encoder import SubspaceEncoder
-from bside.sysid import EM, HMC, MultiShootingLoss, Posterior, map_estimate, noise_continuation
+from bside.sysid import (EM, HMC, MultiShootingLoss, Posterior, autocorrelation, effective_sample_size,
+                         laplace_covariance, map_estimate, noise_continuation)
 
 
 __all__ = (
@@ -67,6 +68,9 @@ __all__ = (
     "UnscentedKalmanFilter",
     "UnscentedRTSSmoother",
     "collate_filtering_distributions",
+    "autocorrelation",
+    "effective_sample_size",
+    "laplace_covariance",
     "map_estimate",
     "noise_continuation",
     "plot_filtering_distributions",

@@ -15,7 +15,8 @@ System-identification utilities built on top of bside's filters and smoothers.
 from .posterior import Posterior
 from .multi_shooting import MultiShootingLoss
 from .em import EM
-from .inference import HMC, NoiseProfile, map_estimate, noise_continuation
+from .inference import (HMC, NoiseProfile, autocorrelation, effective_sample_size, laplace_covariance,
+                        map_estimate, noise_continuation)
 
 __all__ = [
     "EM",
@@ -23,6 +24,9 @@ __all__ = [
     "NoiseProfile",
     "MultiShootingLoss",
     "Posterior",
+    "autocorrelation",
+    "effective_sample_size",
+    "laplace_covariance",
     "map_estimate",
     "noise_continuation",
 ]
