@@ -357,15 +357,15 @@ class AdditiveModel(Model):
         Draw a sample from the additive noise model: ``f(x, u) + eta`` with
         ``eta ~ N(0, Q)``.
 
-        If ``N`` is None, draws one independent noise sample per row of ``x``
-        (the usual case for ensemble / particle propagation). If ``N`` is
+        If ``N`` is None, draws one independent noise sample per point of ``x``
+        (every leading dimension; the usual case for ensemble / particle
+        propagation). If ``N`` is
         provided, draws ``N`` total samples (broadcasting the deterministic part
         across them).
         """
         
-        if N is None:
-            N = x.shape[0] if x.ndim > 1 else 1
-        noise = torch.randn(N, self.out_dim) @ self.sqrt_noise_cov.T
+        shape = x.shape[:-1] if N is None else (N,)
+        noise = torch.einsum('...ij,...j->...i', self.sqrt_noise_cov, torch.randn(*shape, self.out_dim))
         return noise + self.forward(x, u)
 
 

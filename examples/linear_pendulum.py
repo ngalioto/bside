@@ -1,22 +1,23 @@
 # %% [markdown]
 # # Linear system identification: pendulum
 #
-# Learn a linear pendulum model from noisy data. The model has the same two
-# halves as in the filtering examples (dynamics and observations, each a
-# deterministic map plus Gaussian noise), but now the matrices are unknown
-# parameters $\theta$.
+# Learn a linear pendulum model from sparse, noisy data, following the
+# high-noise case of Galioto & Gorodetsky (2020), Sec. 6.3: 40 measurements of
+# both states over 4 s with noise standard deviation 0.1. The model has the same
+# two halves as in the filtering examples, but now everything is unknown:
 #
-# The filter turns the model into a likelihood: its predict / update recursion
-# accumulates $p(y_{1:T} \mid \theta) = \prod_k p(y_k \mid y_{1:k-1}, \theta)$.
-# Two ways to use it are shown:
+# - **dynamics**: $x_k = A x_{k-1} + \xi_k,\quad \xi_k \sim \mathcal{N}(0, \sigma_\xi^2 I)$
+# - **observations**: $y_k = x_k + \eta_k,\quad \eta_k \sim \mathcal{N}(0, \sigma_\eta^2 I)$
 #
-# - **EM** finds a point estimate of $(A, \Sigma, C, \Gamma)$: a Kalman filter and RTS smoother
-#   (E-step) alternate with closed-form updates (M-step).
-# - **Bayesian inference** samples the posterior
-#   $p(\theta \mid y) \propto p(y \mid \theta)\, p(\theta)$ with delayed-rejection
-#   adaptive Metropolis (DRAM). This needs `pip install bside[mcmc]`.
+# with parameters $\theta = (A_{11}, A_{12}, A_{21}, A_{22}, \log\sigma_\xi, \log\sigma_\eta)$.
+# The Kalman filter turns the model into the likelihood
+# $p(y_{1:n} \mid \theta) = \prod_k p(y_k \mid y_{1:k-1}, \theta)$. The example
+# uses it in four ways: EM, MAP estimation, and posterior sampling with DRAM
+# and with HMC. DRAM needs `pip install bside[mcmc]`.
 
 # %%
+import math
+
 import torch
 import matplotlib.pyplot as plt
 
@@ -26,105 +27,165 @@ from mcmc_samplers import DelayedRejectionAdaptiveMetropolis, SampleVisualizer
 torch.manual_seed(0)
 
 # %% [markdown]
-# ## Data from the true system
+# ## Data
+#
+# The true system is the exactly discretized linear pendulum (no process noise).
 
 # %%
-dt, g, qc, r = 0.1, 9.81, 0.1, 0.1
-T = 50
-xdim, ydim = 2, 2
+dt, g, sigma = 0.1, 9.81, 0.1
+n = 40
+xdim = ydim = 2
 
 A_true = torch.linalg.matrix_exp(torch.tensor([[0.0, 1.0], [-g, 0.0]]) * dt)
-Sigma = bside.PSDMatrix(qc * torch.tensor([[dt**3 / 3, dt**2 / 2], [dt**2 / 2, dt]]))
-Gamma = bside.PSDMatrix(r**2 * torch.eye(ydim))
-C = bside.Matrix(torch.eye(ydim))
-
-true_ssm = bside.SSM(
-    xdim=xdim, ydim=ydim,
-    dynamics=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(A_true)), noise_cov=Sigma),
-    observations=bside.LinearGaussianModel(model=bside.LinearModel(C), noise_cov=Gamma),
-)
-
-x0 = torch.tensor([1.5, 0.0])
-x_true, y = true_ssm.measure(x=x0, T=T, return_x=True)
+x0 = torch.tensor([0.1, -0.5])
+x_true = bside.LinearModel(bside.Matrix(A_true)).predict(x0, T=n)
+y = x_true + sigma * torch.randn_like(x_true)
 data = bside.Data(y=y)
 init_dist = bside.FilteringDistribution(mean=x0, cov=0.01 * torch.eye(xdim))
 
-t = torch.arange(1, T + 1) * dt
-plt.figure(figsize=(8, 3))
-plt.plot(t, y, '.', label=['angle', 'angular velocity'])
-plt.plot(t, x_true, 'k', lw=1)
-plt.xlabel('time')
-plt.legend()
+t = torch.arange(1, n + 1) * dt
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+for i, (ax, name) in enumerate(zip(axes, ['angle', 'angular velocity'])):
+    ax.plot(t, x_true[:, i], 'k', lw=1, label='truth')
+    ax.plot(t, y[:, i], '.', color='C0', label='data')
+    ax.set_title(name)
+    ax.set_xlabel('time')
+axes[0].legend()
 plt.show()
+
+# %% [markdown]
+# ## Model with learnable parameters
+#
+# Each learnable matrix has a `mask` of learnable entries and `indices` that say
+# which element of $\theta$ fills each entry. A `CholeskyMatrix` parameterizes a
+# covariance by its log-Cholesky factor. With a diagonal mask and a shared
+# index, entry $\theta_j$ is $\log\sigma$ and the covariance is $\sigma^2 I$.
+# The priors are flat on $A$ and half-normal on the two variances.
+
+# %%
+diag = torch.eye(2, dtype=torch.bool)
+A = bside.Matrix(torch.eye(2), mask=torch.ones(2, 2, dtype=torch.bool), indices=torch.arange(4))
+Sigma = bside.CholeskyMatrix(0.01 * torch.eye(2), mask=diag, indices=torch.tensor([4, 4]))
+Gamma = bside.CholeskyMatrix(0.01 * torch.eye(2), mask=diag, indices=torch.tensor([5, 5]))
+model = bside.SSM(
+    xdim=xdim, ydim=ydim,
+    dynamics=bside.LinearGaussianModel(model=bside.LinearModel(A), noise_cov=Sigma),
+    observations=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(2))), noise_cov=Gamma),
+)
+
+
+def log_prior(theta, tau=1.0):
+    """Half-normal(tau) on each variance, written for the log-std parameters (incl. Jacobian)."""
+    v = torch.exp(2 * theta[..., 4:])
+    return (-0.5 * (v / tau) ** 2 + torch.log(2 * v)).sum(-1)
+
+
+posterior = bside.Posterior(bside.ParallelKalmanFilter(model), data, init_dist, prior=log_prior)
+theta_true = torch.cat([A_true.flatten(), torch.tensor([float("-inf"), math.log(sigma)])])  # no true process noise
+param_names = ['A11', 'A12', 'A21', 'A22', 'log sd proc', 'log sd meas']
 
 # %% [markdown]
 # ## Expectation-maximization
 #
-# Start from $A = I$ with inflated noise covariances. $C$ is also re-estimated,
-# so $A$ is identifiable only up to a change of state coordinates. We therefore
-# compare its eigenvalues, which do not depend on the coordinates.
+# EM gives a point estimate of all of $(A, \Sigma, C, \Gamma)$. A Kalman filter
+# and RTS smoother (E-step) alternate with closed-form updates (M-step). $C$ is
+# re-estimated too, so $A$ is identifiable only up to a change of state
+# coordinates; its eigenvalues are what to compare.
 
 # %%
-def fresh_ssm(A0, Sigma0, Gamma0):
-    return bside.SSM(
-        xdim=xdim, ydim=ydim,
-        dynamics=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(A0)), noise_cov=bside.PSDMatrix(Sigma0)),
-        observations=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(ydim))), noise_cov=bside.PSDMatrix(Gamma0)),
-    )
-
-
-em_ssm = fresh_ssm(torch.eye(xdim), 0.1 * torch.eye(xdim), 0.1 * torch.eye(ydim))
-em = bside.EM(ssm=em_ssm, init_dist=init_dist)
-log_marg = em.fit(data, n_iter=200, tol=1e-4)
-
-print(f'EM iterations: {len(log_marg)},  log p(y): {log_marg[0]:.2f} -> {log_marg[-1]:.2f}')
+em_model = bside.SSM(
+    xdim=xdim, ydim=ydim,
+    dynamics=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(2))), noise_cov=0.1 * torch.eye(2)),
+    observations=bside.LinearGaussianModel(model=bside.LinearModel(bside.Matrix(torch.eye(2))), noise_cov=0.1 * torch.eye(2)),
+)
+log_marg = bside.EM(ssm=em_model, init_dist=init_dist).fit(data, n_iter=500, tol=1e-5)
+print(f'EM: {len(log_marg)} iterations, log p(y) {log_marg[0]:.1f} -> {log_marg[-1]:.1f}')
 print('eigenvalues of A, true:', torch.linalg.eigvals(A_true))
-print('eigenvalues of A, EM:  ', torch.linalg.eigvals(em_ssm.dynamics.mat_x))
+print('eigenvalues of A, EM:  ', torch.linalg.eigvals(em_model.dynamics.mat_x))
+
+# %% [markdown]
+# ## MAP estimate
+#
+# The filter is differentiable, so `map_estimate` maximizes the log posterior
+# with Adam. A batch of starting points `(P, p)` is optimized in one pass.
+
+# %%
+starts = torch.cat([torch.eye(2).flatten() + 0.1 * torch.randn(4, 4), torch.full((4, 2), -1.0)], dim=-1)
+theta_map, trace = bside.map_estimate(posterior, starts, n_steps=500, lr=0.02)
+best = theta_map[trace[-1].argmax()]
+for name, true, est in zip(param_names, theta_true, best):
+    print(f'{name:>12}: true {true:7.3f}   MAP {est:7.3f}')
 
 plt.figure(figsize=(5, 3))
-plt.plot(log_marg)
-plt.xlabel('EM iteration')
-plt.ylabel('log p(y)')
+plt.plot(trace)
+plt.xlabel('Adam step')
+plt.ylabel('log posterior')
+plt.ylim(trace[-1].min() - 50, trace.max() + 5)
 plt.show()
 
 # %% [markdown]
-# ## Bayesian inference with DRAM
+# ## Posterior sampling: DRAM and HMC
 #
-# Here the four entries of $A$ are uncertain and the other matrices are known.
-# Marking an entry as learnable takes a `mask`, and `indices` maps each masked
-# entry to an element of $\theta$. `Posterior` wraps the Kalman filter's
-# marginal likelihood (with a flat prior here) into the target density that
-# the sampler evaluates.
+# Both samplers target the same posterior and start from the MAP estimate.
+# DRAM (delayed-rejection adaptive Metropolis) needs only the log density.
+# HMC also uses its gradient and runs several chains as one batch.
 
 # %%
-A_learn = bside.Matrix(
-    default=torch.eye(xdim),
-    mask=torch.ones(xdim, xdim, dtype=torch.bool),
-    indices=torch.arange(xdim**2),
-)
-model = bside.SSM(
-    xdim=xdim, ydim=ydim,
-    dynamics=bside.LinearGaussianModel(model=bside.LinearModel(A_learn), noise_cov=Sigma),
-    observations=true_ssm.observations,
-)
-posterior = bside.Posterior(filter=bside.KalmanFilter(model), data=data, init_dist=init_dist)
-
-dram = DelayedRejectionAdaptiveMetropolis(
-    target=posterior,
-    x0=torch.eye(xdim).flatten(),
-    cov=1e-3 * torch.eye(xdim**2),
-)
+dram = DelayedRejectionAdaptiveMetropolis(target=posterior, x0=best, cov=1e-3 * torch.eye(6))
 with torch.no_grad():
-    samples, log_probs = dram(3000)
-samples = samples[500:]  # discard burn-in
+    dram_samples, _ = dram(5000)
+dram_samples = dram_samples[1000:]
+print(f'DRAM acceptance rate: {100 * dram.acceptance_ratio:.1f}%')
 
-print(f'acceptance rate: {100 * dram.acceptance_ratio:.1f}%')
-print('posterior mean of A:\n', samples.mean(0).reshape(xdim, xdim))
-print('posterior std of A:\n', samples.std(0).reshape(xdim, xdim))
-print('true A:\n', A_true)
+hmc = bside.HMC(posterior, n_leapfrog=12)
+hmc_samples, _ = hmc(best.expand(4, 6), n_samples=500, n_warmup=300)
+hmc_samples = hmc_samples.reshape(-1, 6)
+print(f'HMC acceptance rate: {100 * hmc.acceptance_rate:.1f}% (4 chains)')
+
+print(f'\n{"":>12} {"true":>8} {"DRAM":>18} {"HMC":>18}')
+for i, name in enumerate(param_names):
+    d, h = dram_samples[:, i], hmc_samples[:, i]
+    print(f'{name:>12} {theta_true[i]:8.3f} {d.mean():8.3f} +/- {d.std():5.3f} {h.mean():8.3f} +/- {h.std():5.3f}')
 
 # %%
-visualizer = SampleVisualizer(samples)
-visualizer.chains()
-visualizer.triangular_hist(bins=40)
+fig, axes = plt.subplots(1, 6, figsize=(15, 2.6))
+for i, ax in enumerate(axes):
+    ax.hist(dram_samples[:, i], bins=40, density=True, alpha=0.5, label='DRAM')
+    ax.hist(hmc_samples[:, i], bins=40, density=True, alpha=0.5, label='HMC')
+    if i < 4 or i == 5:
+        ax.axvline(theta_true[i], color='k', lw=1)
+    ax.set_title(param_names[i], fontsize=9)
+axes[0].legend(fontsize=8)
+fig.tight_layout()
+plt.show()
+
+SampleVisualizer(hmc_samples[:, :4]).triangular_hist(bins=40)
+plt.show()
+
+# %% [markdown]
+# ## Posterior predictive
+#
+# Push 500 posterior samples of $A$ forward past the end of the data (as in the
+# paper's Fig. 6). The band shows where the posterior expects the pendulum to
+# be, and it widens as the forecast moves away from the data.
+
+# %%
+horizon = 2 * n
+draws = hmc_samples[torch.randint(len(hmc_samples), (500,))]
+model.update(draws)  # a batch of 500 models
+paths = model.dynamics.model.predict(x0.expand(500, 2), T=horizon)
+truth = bside.LinearModel(bside.Matrix(A_true)).predict(x0, T=horizon)
+
+t_long = torch.arange(1, horizon + 1) * dt
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+for i, (ax, name) in enumerate(zip(axes, ['angle', 'angular velocity'])):
+    lo, mid, hi = torch.quantile(paths[..., i], torch.tensor([0.025, 0.5, 0.975]), dim=0)
+    ax.fill_between(t_long, lo, hi, color='C1', alpha=0.3, label='95% posterior predictive')
+    ax.plot(t_long, mid, 'C1', label='median')
+    ax.plot(t_long, truth[:, i], 'k', lw=1, label='truth')
+    ax.plot(t, y[:, i], '.', color='C0', label='data')
+    ax.axvline(n * dt, color='gray', ls='--', lw=1)
+    ax.set_title(name)
+    ax.set_xlabel('time')
+axes[0].legend(fontsize=8)
 plt.show()

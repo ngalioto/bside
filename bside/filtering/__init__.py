@@ -6,6 +6,7 @@ Modules:
 - `filters`: Implements various filtering algorithms (Kalman, square-root Kalman,
   Unscented, Gauss-Hermite, Cubature, Ensemble, Particle).
 - `functional`: Contains stateless helpers used by the filters and smoothers.
+- `parallel`: Parallel-in-time (prefix-scan) Kalman filter and RTS smoother.
 - `smoothers`: RTS / Unscented-RTS / Particle backward passes that consume
   a forward-filtering history.
 - `plotting`: Plotting helpers for filtering distributions.
@@ -35,6 +36,8 @@ from .filters import (
     UnscentedKalmanPredict,
 )
 
+from .parallel import ParallelKalmanFilter, ParallelRTSSmoother
+
 from .smoothers import (
     ParticleSmoother,
     RTSSmoother,
@@ -61,6 +64,8 @@ __all__ = [
     'KalmanFilter',
     'KalmanPredict',
     'KalmanUpdate',
+    'ParallelKalmanFilter',
+    'ParallelRTSSmoother',
     'ParticleFilter',
     'ParticleSmoother',
     'RTSSmoother',

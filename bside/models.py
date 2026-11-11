@@ -43,9 +43,9 @@ class Matrix(torch.nn.Module):
         self.pdim = torch.numel(torch.unique(indices))
 
         # initialize parameters
-        self.params = torch.nn.Parameter(torch.zeros(self.pdim)) if self.pdim > 0 else None
-        if self.pdim > 0:
-            self.params.data = self.default[self.mask]
+        # Own (fallback) parameters: one per learnable entry, in mask order.  A global
+        # parameter vector passed to `forward` / `update` is read through `indices`.
+        self.params = torch.nn.Parameter(self.default[self.mask].clone()) if self.pdim > 0 else None
         self.update()
 
     @property
@@ -117,11 +117,13 @@ class Matrix(torch.nn.Module):
         params: Tensor | None = None
     ):
 
-        p = self.params if params is None or self.mask is None else params
+        if self.mask is None:
+            return self.default.clone()
+        values = self.params if params is None else params[..., self.indices]
 
-        matrix = self.default.clone()
-        if p is not None:
-            matrix[self.mask] = p[self.indices]
+        # A batch of parameter vectors (..., p) gives a batch of matrices (..., n, m).
+        matrix = self.default.expand(*values.shape[:-1], *self.default.shape).clone()
+        matrix[..., self.mask] = values
         return matrix
     
     def update(
@@ -167,7 +169,7 @@ class PSDMatrix(Matrix):
             if default is None:
                 # Materialize the dense form once so the Matrix base class has shape/default
                 # to work with. Downstream operations still prefer the cached Cholesky factor.
-                default = default_sqrt @ default_sqrt.T
+                default = default_sqrt @ default_sqrt.mT
         else:
             # Lazy: the Cholesky factor is computed on first access to `.sqrt`.
             self._sqrt_val = None
@@ -197,7 +199,7 @@ class PSDMatrix(Matrix):
     ) -> Tensor:
         
         if not self._up_to_date:
-            self._val = self.sqrt @ self.sqrt.T
+            self._val = self.sqrt @ self.sqrt.mT
             self._up_to_date = True
         return self._val
 
@@ -282,10 +284,10 @@ class SquaredMatrix(Matrix):
         params: Tensor | None = None
     ) -> Tensor:
 
-        p = self.params if params is None or self.mask is None else params
-        if p is None:
-            return self.default.clone()
-        return super().forward(p ** 2)
+        matrix = super().forward(params)
+        if self.mask is not None:
+            matrix[..., self.mask] = matrix[..., self.mask] ** 2
+        return matrix
     
 class DiagonalMatrix(PSDMatrix):
     """
@@ -319,10 +321,10 @@ class DiagonalMatrix(PSDMatrix):
         Diagonal square root: sqrt of the diagonal entries placed back on the diagonal.
         """
         
-        diag = torch.diagonal(self.val)
+        diag = torch.diagonal(self.val, dim1=-2, dim2=-1)
         if torch.any(diag < 0):
             raise ValueError('Matrix is not positive semi-definite')
-        return torch.diag(torch.sqrt(diag))
+        return torch.diag_embed(torch.sqrt(diag))
         
     def compute_inv(
         self
@@ -332,11 +334,63 @@ class DiagonalMatrix(PSDMatrix):
         Diagonal inverse: reciprocal of the diagonal entries placed back on the diagonal.
         """
         
-        diag = torch.diagonal(self.val)
+        diag = torch.diagonal(self.val, dim1=-2, dim2=-1)
         if torch.any(diag == 0):
             raise ValueError('Matrix is not invertible')
-        return torch.diag(1.0 / diag)
+        return torch.diag_embed(1.0 / diag)
         
+
+class CholeskyMatrix(PSDMatrix):
+    """
+    Covariance parameterized by its log-Cholesky factor, so every parameter value
+    gives a valid positive-definite matrix:
+
+        Sigma = L L^T,   L = tril(Lambda, -1) + diag(exp(diag(Lambda)))
+
+    ``default`` is the initial covariance; ``mask`` (lower triangle only) marks
+    which entries of the unconstrained ``Lambda`` are learnable.  A diagonal mask
+    gives a log-variance parameterization of a diagonal covariance.
+    """
+
+    def __init__(
+        self,
+        default: Tensor,
+        mask: Tensor | None = None,
+        indices: Tensor = torch.empty(0),
+    ) -> None:
+
+        if mask is not None and torch.triu(mask, 1).any():
+            raise ValueError('`mask` of a CholeskyMatrix must be lower triangular.')
+        L = torch.linalg.cholesky(default)
+        log_chol = torch.tril(L, -1) + torch.diag_embed(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)))
+        super().__init__(default=log_chol, mask=mask, indices=indices)
+        self.update()  # PSDMatrix.__init__ resets the caches after the first update
+
+    def cholesky(
+        self,
+        params: Tensor | None = None
+    ) -> Tensor:
+        """The lower Cholesky factor ``L`` for the given parameters."""
+
+        log_chol = Matrix.forward(self, params)
+        return torch.tril(log_chol, -1) + torch.diag_embed(torch.exp(torch.diagonal(log_chol, dim1=-2, dim2=-1)))
+
+    def forward(
+        self,
+        params: Tensor | None = None
+    ) -> Tensor:
+
+        L = self.cholesky(params)
+        return L @ L.mT
+
+    def update(
+        self,
+        params: Tensor | None = None
+    ) -> None:
+
+        # The factor is known exactly; the dense matrix is formed only on demand.
+        self.sqrt = self.cholesky(params)
+
 
 class FeedforwardNetwork(torch.nn.Module):
 
@@ -373,7 +427,7 @@ class FeedforwardNetwork(torch.nn.Module):
         u: Tensor | None = None
     ) -> Tensor:
 
-        x = torch.cat((x,u), dim=1) if u is not None else x.clone()
+        x = torch.cat((x, u), dim=-1) if u is not None else x.clone()
         for layer in self.layers:
             x = layer(x)
         return x
@@ -414,6 +468,6 @@ class ResidualNetwork(torch.nn.Module):
         u: Tensor | None = None
     ) -> Tensor:
 
-        x = torch.cat((x,u), dim=1) if u is not None else x.clone()
+        x = torch.cat((x, u), dim=-1) if u is not None else x.clone()
 
         return self.residual(x) + self.feedforward(x)

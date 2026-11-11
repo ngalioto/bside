@@ -8,8 +8,9 @@
 # - **dynamics**: $x_k = A x_{k-1} + \xi_k,\quad \xi_k \sim \mathcal{N}(0, \Sigma)$
 # - **observations**: $y_k = C x_k + \eta_k,\quad \eta_k \sim \mathcal{N}(0, \Gamma)$
 #
-# Methods shown: Kalman filter, square-root Kalman filter, RTS smoother, and
-# filtering a batch of trajectories at once.
+# Methods shown: Kalman filter, square-root Kalman filter, RTS smoother, their
+# parallel-in-time versions, irregularly sampled data, and filtering a batch of
+# trajectories at once.
 
 # %%
 import time
@@ -27,8 +28,8 @@ torch.manual_seed(0)
 # The state is (angle, angular velocity); only the angle is measured.
 
 # %%
-dt, g, qc, r = 0.01, 9.81, 0.1, 0.1
-T = 500
+dt, g, qc, r = 0.1, 9.81, 0.1, 0.1
+T = 60
 xdim, ydim = 2, 1
 
 A = bside.Matrix(torch.linalg.matrix_exp(torch.tensor([[0.0, 1.0], [-g, 0.0]]) * dt))
@@ -48,7 +49,7 @@ init_dist = bside.FilteringDistribution(mean=x0, cov=0.1 * torch.eye(xdim))
 
 t = torch.arange(T + 1) * dt
 plt.figure(figsize=(8, 3))
-plt.plot(t[1:], y, '.', ms=2, label='measurements')
+plt.plot(t[1:], y, '.', label='measurements')
 plt.plot(t, x_true[:, 0], 'k', lw=1, label='true angle')
 plt.xlabel('time')
 plt.legend()
@@ -125,3 +126,49 @@ loop_time = time.perf_counter() - start
 
 print(f'log-likelihoods: shape {tuple(ll.shape)}, max difference from loop {(ll - ll_loop).abs().max().item():.1e}')
 print(f'batched: {batched_time:.2f} s   loop: {loop_time:.2f} s')
+
+# %% [markdown]
+# ## Parallel-in-time filtering and smoothing
+#
+# `ParallelKalmanFilter` and `ParallelRTSSmoother` compute the same estimates as
+# a prefix scan over time (Sarkka & Garcia-Fernandez, 2021): about log2(T)
+# vectorized passes instead of $T$ sequential steps.
+
+# %%
+long = bside.Data(y=ssm.measure(x=x0, T=10_000))
+for flt in (kf, bside.ParallelKalmanFilter(ssm)):
+    start = time.perf_counter()
+    hist, ll_long = flt.filter(long, init_dist, return_history=True, compute_log_prob=True)
+    print(f'{type(flt).__name__:<22} T=10000: {time.perf_counter() - start:.2f} s, log p(y) = {ll_long.item():.2f}')
+
+par_m, _ = bside.collate_filtering_distributions(bside.ParallelRTSSmoother(ssm).smooth(kf_hist))
+print(f'max |RTS - parallel RTS| on the first data set: {(par_m - rts_m).abs().max().item():.1e}')
+
+# %% [markdown]
+# ## Irregularly sampled data
+#
+# Measurements need not arrive at every step. `Data(y, mask=...)` takes a mask
+# that is 1 where a measurement is available and 0 elsewhere; at unmeasured
+# times the filter only predicts, so the uncertainty grows until the next
+# measurement arrives. The values of `y` there are ignored.
+
+# %%
+mask = torch.zeros(T, dtype=torch.bool)
+mask[torch.cumsum(torch.randint(1, 7, (T,)), 0)[:T].clamp(max=T - 1)] = True  # random gaps of 1-6 steps
+sparse = bside.Data(y=y, mask=mask)
+
+sparse_hist = kf.filter(sparse, init_dist, return_history=True)
+sparse_m, sparse_P = bside.collate_filtering_distributions(sparse_hist)
+smooth_m, smooth_P = bside.collate_filtering_distributions(bside.RTSSmoother(ssm).smooth(sparse_hist))
+print(f'{int(mask.sum())} of {T} time points measured')
+
+fig, ax = plt.subplots(figsize=(8, 3))
+ax.plot(t, x_true[:, 0], 'k', lw=1, label='true angle')
+ax.plot(t[1:][mask], y[mask], 'o', ms=3, color='k', label='measurements')
+for m, P, label, color in [(sparse_m, sparse_P, 'filter', 'C0'), (smooth_m, smooth_P, 'smoother', 'C1')]:
+    sd = P[:, 0, 0].sqrt()
+    ax.plot(t, m[:, 0], color=color, label=label)
+    ax.fill_between(t, m[:, 0] - 2 * sd, m[:, 0] + 2 * sd, color=color, alpha=0.2)
+ax.set_xlabel('time')
+ax.legend(ncol=4, fontsize=8)
+plt.show()

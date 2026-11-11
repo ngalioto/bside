@@ -52,19 +52,26 @@ def _evaluate(
     """
     Evaluate ``model`` at a set of points ``X`` with shape ``(..., N, d)``.
 
-    Points are flattened to ``(-1, d)`` before the call so user-supplied maps
-    only ever see a 2-D batch, and the input ``u`` (shape ``(..., udim)``) is
-    broadcast to every point.  ``stochastic=True`` draws from the model
-    (deterministic part + noise) instead of evaluating the deterministic part.
+    The point axis is moved to the front while the model is called, so model
+    parameters with batch dimensions (a batch of parameter vectors, see
+    `bside.sysid.Posterior`) broadcast against the remaining leading dimensions.
+    Model maps must therefore act on the last axis and broadcast over any
+    leading ones.  The input ``u`` (shape ``(..., udim)``) is shared by every
+    point.  ``stochastic=True`` draws from the model (deterministic part +
+    noise) instead of evaluating the deterministic part.
     """
 
-    lead = X.shape[:-1]
-    Xf = X.reshape(-1, X.shape[-1])
-    uf = None
-    if u is not None:
-        uf = u.unsqueeze(-2).expand(*lead, u.shape[-1]).reshape(-1, u.shape[-1])
-    out = model.sample(Xf, uf) if stochastic else model(Xf, uf)
-    return out.reshape(*lead, out.shape[-1])
+    Xm = X.movedim(-2, 0)
+    um = None if u is None else u.unsqueeze(0).expand(*Xm.shape[:-1], u.shape[-1])
+    out = model.sample(Xm, um) if stochastic else model(Xm, um)
+    return out.movedim(0, -2)
+
+
+def _broadcast_batch(*mats: Tensor) -> list[Tensor]:
+    """Expand matrices ``(..., n, m)`` to a common batch shape."""
+
+    batch = torch.broadcast_shapes(*(M.shape[:-2] for M in mats))
+    return [M.expand(*batch, *M.shape[-2:]) for M in mats]
 
 
 def _positive_diagonal(
@@ -170,7 +177,7 @@ def enkf_predict(
     cross-covariance between the input and propagated particles.
     """
 
-    dist_Y = FilteringDistribution(particles=model.sample(dist.particles, u))
+    dist_Y = FilteringDistribution(particles=_evaluate(model, dist.particles, u, stochastic=True))
 
     if crossCov:
         dist_Y.mean = torch.mean(dist_Y.particles, 0)
@@ -282,8 +289,7 @@ def srkf_predict(
     returns ``None`` in place of a cross-covariance.
     """
 
-    AL = model.mat_x @ dist.sqrt_cov
-    L_Q = model.sqrt_noise_cov.expand(*AL.shape[:-2], *model.sqrt_noise_cov.shape)
+    AL, L_Q = _broadcast_batch(model.mat_x @ dist.sqrt_cov, model.sqrt_noise_cov)
     new_dist = FilteringDistribution(
         mean=model(dist.mean, u),
         sqrt_cov=_qr_chol(torch.cat([AL, L_Q], dim=-1)),
@@ -320,13 +326,12 @@ def srkf_update(
     """
 
     H = model.mat_x
-    L_pred = dist_x.sqrt_cov
+    HL, L_pred, L_R = _broadcast_batch(H @ dist_x.sqrt_cov, dist_x.sqrt_cov, model.sqrt_noise_cov)
     batch = L_pred.shape[:-2]
-    L_R = model.sqrt_noise_cov.expand(*batch, *model.sqrt_noise_cov.shape)
     xdim, ydim = L_pred.shape[-1], L_R.shape[-1]
 
     top = torch.cat([L_R.mT, L_R.new_zeros(*batch, ydim, xdim)], dim=-1)
-    bot = torch.cat([(H @ L_pred).mT, L_pred.mT], dim=-1)
+    bot = torch.cat([HL.mT, L_pred.mT], dim=-1)
     R = torch.linalg.qr(torch.cat([top, bot], dim=-2), mode='reduced').R
 
     L_S_T, F_T, L_xpost_T = R[..., :ydim, :ydim], R[..., :ydim, ydim:], R[..., ydim:, ydim:]
@@ -360,7 +365,7 @@ def bootstrap_pf_predict(
     """Bootstrap proposal: sample x_t^i ~ p(x_t | x_{t-1}^i)."""
 
     return FilteringDistribution(
-        particles=model.sample(dist.particles, u),
+        particles=_evaluate(model, dist.particles, u, stochastic=True),
         log_weights=dist.log_weights,
     )
 

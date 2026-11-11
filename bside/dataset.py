@@ -43,7 +43,8 @@ class Data:
     def __init__(
         self,
         y: Tensor | ndarray | None = None,
-        u: Tensor | ndarray | None = None
+        u: Tensor | ndarray | None = None,
+        mask: Tensor | ndarray | None = None
     ) -> None:        
         
         """
@@ -53,6 +54,11 @@ class Data:
             The state data, by default None
         u: Tensor | ndarray | None = None, optional
             The control input data, by default None
+        mask: Tensor | ndarray | None = None, optional
+            Shape ``(..., T)``: 1 where a measurement is available at that time
+            point, 0 where it is not (irregular sampling on a regular grid).  The
+            values of ``y`` at unavailable times are ignored.  If omitted, rows of
+            ``y`` containing NaN are treated as unavailable.
         
         Raises
         ------
@@ -89,6 +95,11 @@ class Data:
             else:
                 self.u = None
                 self.udim = 0
+            if mask is not None:
+                mask = torch.as_tensor(mask).to(torch.bool)
+                if mask.shape != self.y.shape[:-1]:
+                    raise ValueError(f"`mask` must have shape {tuple(self.y.shape[:-1])}, got {tuple(mask.shape)}.")
+            self._mask = mask
         elif u is not None:
             raise ValueError("The control input cannot be provided without the state data.")
         else:
@@ -97,6 +108,7 @@ class Data:
             self.ydim = 0
             self.udim = 0
             self.size = 0
+            self._mask = None
 
     def __iter__(
         self
@@ -134,6 +146,16 @@ class Data:
         return self.size
 
     @property
+    def mask(
+        self
+    ) -> Tensor:
+        """Boolean ``(..., T)``: True where a measurement is available."""
+
+        if self._mask is not None:
+            return self._mask
+        return ~torch.isnan(self.y).any(-1)
+
+    @property
     def batch_shape(
         self
     ) -> torch.Size:
@@ -168,9 +190,9 @@ class Data:
         if self.y is None:
             raise ValueError("Cannot index an empty Data object.")
         elif self.u is None:
-            return Data(self.y[index])
+            return Data(self.y[index], mask=None if self._mask is None else self._mask[index])
         else:
-            return Data(self.y[index], self.u[index])
+            return Data(self.y[index], self.u[index], mask=None if self._mask is None else self._mask[index])
             
     def __repr__(
         self

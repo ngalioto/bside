@@ -23,18 +23,26 @@ torch.manual_seed(0)
 # %% [markdown]
 # ## Model and data
 #
-# $\Psi$ is an explicit-Euler step of $\ddot\theta = -g \sin\theta$, and the
+# $\Psi$ is one RK4 step of $\ddot\theta = -g \sin\theta$, and the
 # sensor measures $h(x) = \sin\theta$.
 
 # %%
-dt, g, qc, r = 0.01, 9.81, 0.1, 0.1
-T = 500
+dt, g, qc, r = 0.1, 9.81, 0.1, 0.1
+T = 60
 xdim, ydim = 2, 1
 
 
+def vector_field(x):
+    theta, omega = x.unbind(-1)
+    return torch.stack([omega, -g * torch.sin(theta)], dim=-1)
+
+
 def pendulum_step(x, u=None):
-    theta, omega = x[..., 0], x[..., 1]
-    return torch.stack([theta + dt * omega, omega - dt * g * torch.sin(theta)], dim=-1)
+    k1 = vector_field(x)
+    k2 = vector_field(x + dt / 2 * k1)
+    k3 = vector_field(x + dt / 2 * k2)
+    k4 = vector_field(x + dt * k3)
+    return x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
 
 
 def sensor(x, u=None):
@@ -56,7 +64,7 @@ init_dist = bside.FilteringDistribution(mean=x0, cov=0.1 * torch.eye(xdim))
 
 t = torch.arange(T + 1) * dt
 plt.figure(figsize=(8, 3))
-plt.plot(t[1:], y, '.', ms=2, label='measurements of sin(angle)')
+plt.plot(t[1:], y, '.', label='measurements of sin(angle)')
 plt.plot(t, x_true[:, 0], 'k', lw=1, label='true angle')
 plt.xlabel('time')
 plt.legend()
@@ -92,15 +100,23 @@ for name, flt in filters.items():
     err = (estimates[name][0] - x_true).pow(2).mean().sqrt()
     print(f'{name:<16} {ll.item():9.2f} {err.item():8.4f}')
 
-fig, axes = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
-for i, (ax, label) in enumerate(zip(axes, ['angle', 'angular velocity'])):
-    ax.plot(t, x_true[:, i], 'k', lw=2, label='true')
-    for name, (m, _) in estimates.items():
-        ax.plot(t, m[:, i], lw=1, label=name)
-    ax.set_ylabel(label)
-axes[0].legend(ncol=3, fontsize=8)
-axes[-1].set_xlabel('time')
-plt.show()
+def plot_estimates(estimates, color):
+    """One row per method: angle and angular velocity, mean +/- 2 std against the truth."""
+    fig, axes = plt.subplots(len(estimates), 2, figsize=(10, 1.9 * len(estimates)), sharex=True, squeeze=False)
+    for row, (name, (m, P)) in zip(axes, estimates.items()):
+        for i, (ax, label) in enumerate(zip(row, ['angle', 'angular velocity'])):
+            sd = P[:, i, i].sqrt()
+            ax.plot(t, x_true[:, i], 'k', lw=1)
+            ax.plot(t, m[:, i], color=color, lw=1)
+            ax.fill_between(t, m[:, i] - 2 * sd, m[:, i] + 2 * sd, color=color, alpha=0.25)
+            ax.set_title(f'{name}: {label}', fontsize=9)
+    for ax in axes[-1]:
+        ax.set_xlabel('time')
+    fig.tight_layout()
+    plt.show()
+
+
+plot_estimates(estimates, 'C0')
 
 # %% [markdown]
 # ## Smoothers
@@ -120,14 +136,4 @@ smoothed = {
 for name, (m, _) in smoothed.items():
     print(f'{name:<18} RMSE {(m - x_true).pow(2).mean().sqrt().item():.4f}')
 
-fig, axes = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
-for i, (ax, label) in enumerate(zip(axes, ['angle', 'angular velocity'])):
-    ax.plot(t, x_true[:, i], 'k', lw=1, label='true')
-    for (name, (m, P)), color in zip(smoothed.items(), ['C0', 'C4']):
-        sd = P[:, i, i].sqrt()
-        ax.plot(t, m[:, i], color=color, label=name)
-        ax.fill_between(t, m[:, i] - 2 * sd, m[:, i] + 2 * sd, color=color, alpha=0.2)
-    ax.set_ylabel(label)
-axes[0].legend()
-axes[-1].set_xlabel('time')
-plt.show()
+plot_estimates(smoothed, 'C1')

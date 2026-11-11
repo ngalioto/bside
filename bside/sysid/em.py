@@ -124,7 +124,9 @@ class EM:
         P_lag: Tensor,
     ) -> None:
 
-        y = data.y
+        # Time points without a measurement (data.mask) get zero weight below.
+        observed = data.mask.to(m_s.dtype)                               # (..., T)
+        y = torch.where(data.mask.unsqueeze(-1), data.y, 0.0)
         # Observed states: with y0 every state x_0..x_K has an observation;
         # otherwise x_0 is the unobserved prior and y row t observes x_{t+1}.
         m_obs = m_s if self.y0 else m_s[..., 1:, :]
@@ -139,12 +141,13 @@ class EM:
         S00 = total(Exx[..., :-1, :, :])                                 # sum_{k<K}  E[x_k x_k^T]
         S11 = total(Exx[..., 1:, :, :])                                  # sum_{k>=1} E[x_k x_k^T]
         S10 = total(P_lag + m_s[..., 1:, :].unsqueeze(-1) * m_s[..., :-1, :].unsqueeze(-2))  # E[x_k x_{k-1}^T]
-        Sxx = total(_second_moment(m_obs, P_obs))
-        Syx = total(y.unsqueeze(-1) * m_obs.unsqueeze(-2))
-        Syy = total(y.unsqueeze(-1) * y.unsqueeze(-2))
+        w = observed[..., None, None]
+        Sxx = total(w * _second_moment(m_obs, P_obs))
+        Syx = total(w * y.unsqueeze(-1) * m_obs.unsqueeze(-2))
+        Syy = total(w * y.unsqueeze(-1) * y.unsqueeze(-2))
 
         n_trans = P_lag.reshape(-1, *P_lag.shape[-2:]).shape[0]
-        n_obs = y.reshape(-1, y.shape[-1]).shape[0]
+        n_obs = observed.sum().item()
 
         # Dynamics: A = S10 S00^{-1},  Q = (S11 - A S10^T) / N
         A_new = torch.linalg.solve(S00, S10, left=False)

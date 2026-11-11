@@ -299,7 +299,9 @@ class Filter(ABC):
         data : Data
             Observations ``y`` with shape ``(T, ydim)`` or ``(B, T, ydim)`` for a
             batch of independent, equal-length trajectories (optional inputs
-            ``u`` with matching leading shape).
+            ``u`` with matching leading shape).  ``data.mask`` marks the time
+            points with a measurement (irregular sampling on a regular grid);
+            elsewhere only the predict step runs.
         init_dist : FilteringDistribution
             Prior ``p(x_0)``; shared by every trajectory in a batch.
         y0 : bool
@@ -320,6 +322,7 @@ class Filter(ABC):
             self.model.update(params)
 
         dist = self.initialize(init_dist)
+        mask = data.mask
         history = [] if return_history else None
         log_prob = 0.0
 
@@ -330,8 +333,8 @@ class Filter(ABC):
             if t > 0 or not y0:
                 dist = self.predict_step(dist, u=_input_at(data.u, t - 1 if y0 else t))
 
-            dist, log_lik = self.update_step(
-                data.y[..., t, :], dist, u=_input_at(data.u, t), compute_log_prob=compute_log_prob,
+            dist, log_lik = self._update_observed(
+                data.y[..., t, :], mask[..., t], dist, _input_at(data.u, t), compute_log_prob,
             )
             if compute_log_prob:
                 log_prob = log_prob + log_lik
@@ -341,6 +344,40 @@ class Filter(ABC):
         self.dist = dist
         output = history if return_history else dist
         return (output, log_prob) if compute_log_prob else output
+
+    def _update_observed(
+        self,
+        y: Tensor,
+        observed: Tensor,
+        dist: FilteringDistribution,
+        u: Tensor | None,
+        compute_log_prob: bool
+    ) -> Tuple[FilteringDistribution, Tensor | float | None]:
+        """
+        Update on ``y`` where ``observed`` (the data mask at this time).  Without a
+        measurement the predicted distribution is kept and the likelihood term
+        is zero.  In a batch each trajectory may differ.
+        """
+
+        if observed.all():
+            return self.update_step(y, dist, u=u, compute_log_prob=compute_log_prob)
+        if not observed.any():
+            return dist, 0.0
+        if not self.supports_batch:
+            raise NotImplementedError(f"{type(self).__name__} does not support batched trajectories.")
+
+        updated, log_lik = self.update_step(
+            torch.where(observed.unsqueeze(-1), y, 0.0), dist, u=u, compute_log_prob=compute_log_prob,
+        )
+        keep = observed.unsqueeze(-1)
+        selected = FilteringDistribution(
+            mean=torch.where(keep, updated.mean, dist.mean),
+            cov=torch.where(keep.unsqueeze(-1), updated.cov, dist.cov),
+            quad_points=updated.quad_points,
+            mean_weights=updated.mean_weights,
+            cov_weights=updated.cov_weights,
+        )
+        return selected, (torch.where(observed, log_lik, 0.0) if compute_log_prob else None)
 
     def nlog_marginal_likelihood(
         self,

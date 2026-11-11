@@ -13,6 +13,7 @@ from bside.dynamics import (
 )
 from bside.filtering import *  # noqa: F401, F403
 from bside.models import (
+    CholeskyMatrix,
     DiagonalMatrix,
     ExponentialMatrix,
     FeedforwardNetwork,
@@ -23,11 +24,12 @@ from bside.models import (
 )
 from bside.ssm import SSM
 from bside.subspace_encoder import SubspaceEncoder
-from bside.sysid import EM, MultiShootingLoss, Posterior
+from bside.sysid import EM, HMC, MultiShootingLoss, Posterior, map_estimate, noise_continuation
 
 
 __all__ = (
     "AdditiveModel",
+    "CholeskyMatrix",
     "CubatureKalmanFilter",
     "Data",
     "DataTrajectories",
@@ -35,6 +37,7 @@ __all__ = (
     "DMDc",
     "DiagonalMatrix",
     "EM",
+    "HMC",
     "EnsembleKalmanFilter",
     "ExponentialMatrix",
     "FeedforwardNetwork",
@@ -49,6 +52,8 @@ __all__ = (
     "MultiShootingLoss",
     "NonlinearAdditiveModel",
     "NonlinearModel",
+    "ParallelKalmanFilter",
+    "ParallelRTSSmoother",
     "ParticleFilter",
     "ParticleSmoother",
     "Posterior",
@@ -62,5 +67,7 @@ __all__ = (
     "UnscentedKalmanFilter",
     "UnscentedRTSSmoother",
     "collate_filtering_distributions",
+    "map_estimate",
+    "noise_continuation",
     "plot_filtering_distributions",
 )

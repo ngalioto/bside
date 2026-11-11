@@ -25,8 +25,8 @@ Each example is a notebook with a matching script in [`examples/`](examples):
 
 | | Linear | Nonlinear |
 |---|---|---|
-| **Filtering & smoothing** | [`linear_filtering`](examples/linear_filtering.ipynb): Kalman, square-root Kalman, RTS, batched | [`nonlinear_filtering`](examples/nonlinear_filtering.ipynb): unscented, Gauss-Hermite, cubature, ensemble, particle; unscented RTS and particle smoothers |
-| **System identification** | [`linear_pendulum`](examples/linear_pendulum.ipynb): EM and Bayesian inference (DRAM) | [`lorenz63`](examples/lorenz63.ipynb): UKF and particle-filter likelihoods, Bayesian inference (DRAM) |
+| **Filtering & smoothing** | [`linear_filtering`](examples/linear_filtering.ipynb): Kalman, square-root Kalman, RTS, parallel-in-time, irregular sampling, batched | [`nonlinear_filtering`](examples/nonlinear_filtering.ipynb): unscented, Gauss-Hermite, cubature, ensemble, particle; unscented RTS and particle smoothers |
+| **System identification** | [`linear_pendulum`](examples/linear_pendulum.ipynb): EM, MAP, posterior sampling (DRAM, HMC), posterior predictive | [`lorenz63`](examples/lorenz63.ipynb): UKF and particle-filter likelihoods, learning process noise by continuation, DRAM, attractor prediction |
 
 ## Citation
 If you find any portion of this repository useful for your own work, please consider citing this [paper](https://link.springer.com/article/10.1007/s11071-020-05925-8):
